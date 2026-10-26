@@ -1,0 +1,26 @@
+# WorkBuddy2API-Hub v0.1.0 —— 补丁镜像（基镜像按 digest 钉死）
+#
+# 用途：环境**不能**访问 Docker Hub 时使用（例如国内服务器只配了镜像加速、
+# 或只通 GHCR）。FROM 的是本项目已验证的官方镜像（按 digest 钉死，构建结果可复现），
+# 只叠加本地的 4 个补丁文件 —— 不需要 pip install，不需要网络，构建是秒级的。
+#
+#   docker build -f Dockerfile.local -t workbuddy2api-hub:0.1.0 .
+#
+# 与 Dockerfile 的区别只在基础镜像：
+#   Dockerfile       FROM python:3.11-alpine      （自包含，但需要能拉 Docker Hub）
+#   Dockerfile.local FROM 官方镜像@sha256:1d7d85fa… （需要能拉 GHCR）
+#
+# 两者产出的应用代码完全一致。
+
+FROM ghcr.io/ardeyouxipianyi/workbuddy2api-hub@sha256:1d7d85fad6adfae447025b321773e5ee8b63f69fd0e25bcc86aa94091da2423d
+
+# 本地补丁层（v0.1.0）
+#
+# **覆盖全部应用模块**，而不是只 COPY 改过的那几个。
+# 原因：基础镜像里的 1.7.33 构建**早于**本项目的基线 commit（d1a8913），
+# 两者已经存在文件差异（例如 wb_identity.py）。只 COPY 补丁文件会让镜像变成
+# 「新版补丁 + 旧版其余模块」的混合体 —— 那种组合跑起来行为无法预测。
+# 基础镜像在这里只承担「Python 运行时与系统依赖」的角色，应用代码一律以
+# 本发布树为准，这样镜像内容 == 发布树内容，可逐文件 sha 校验。
+COPY wb_*.py dashboard.html ./
+
