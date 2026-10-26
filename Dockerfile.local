@@ -1,10 +1,10 @@
-# WorkBuddy2API-Hub v0.1.2 —— 补丁镜像（基镜像按 digest 钉死）
+# WorkBuddy2API-Hub v0.1.3 —— 补丁镜像（基镜像按 digest 钉死）
 #
 # 用途：环境**不能**访问 Docker Hub 时使用（例如国内服务器只配了镜像加速、
 # 或只通 GHCR）。FROM 的是本项目已验证的官方镜像（按 digest 钉死，构建结果可复现），
 # 只叠加本地的 4 个补丁文件 —— 不需要 pip install，不需要网络，构建是秒级的。
 #
-#   docker build -f Dockerfile.local -t workbuddy2api-hub:0.1.2 .
+#   docker build -f Dockerfile.local -t workbuddy2api-hub:0.1.3 .
 #
 # 与 Dockerfile 的区别只在基础镜像：
 #   Dockerfile       FROM python:3.11-alpine      （自包含，但需要能拉 Docker Hub）
@@ -14,7 +14,7 @@
 
 FROM ghcr.io/ardeyouxipianyi/workbuddy2api-hub@sha256:1d7d85fad6adfae447025b321773e5ee8b63f69fd0e25bcc86aa94091da2423d
 
-# 本地补丁层（v0.1.2）
+# 本地补丁层（v0.1.3）
 #
 # **覆盖全部应用模块**，而不是只 COPY 改过的那几个。
 # 原因：基础镜像里的 1.7.33 构建**早于**本项目的基线 commit（d1a8913），

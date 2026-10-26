@@ -1,8 +1,8 @@
-# WorkBuddy2API-Hub v0.1.2
+# WorkBuddy2API-Hub v0.1.3
 #
 # 先构建镜像，再启动：
-#   docker build -f Dockerfile.local -t workbuddy2api-hub:0.1.2 .   # 基镜像不可达时用这个
-#   docker build -t workbuddy2api-hub:0.1.2 .                      # 能访问 Docker Hub 时用这个
+#   docker build -f Dockerfile.local -t workbuddy2api-hub:0.1.3 .   # 基镜像不可达时用这个
+#   docker build -t workbuddy2api-hub:0.1.3 .                      # 能访问 Docker Hub 时用这个
 #   docker compose up -d
 #
 # 面板密码放在同目录的 .env（权限 0600，root 独占）：
@@ -11,7 +11,7 @@
 
 services:
   wb-proxy:
-    image: workbuddy2api-hub:0.1.2
+    image: workbuddy2api-hub:0.1.3
     container_name: wb-proxy
     restart: unless-stopped
     # 默认 root(0:0)，即历史行为。想用自己的宿主机用户就设
