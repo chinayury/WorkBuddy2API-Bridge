@@ -10274,7 +10274,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "0.1.3",
+        "version": "0.1.4",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -15255,6 +15255,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 except Exception:
                     detail = ""
                 reset_at = parse_rate_limit_reset(detail)
+                # 上游回了 429（限流）而不是 403 11140（判非法），说明这个凭据
+                # **被上游接受了** —— 与「未验证」护栏的假设正好相反。解除标记，
+                # 否则一个只是被限流的号会被永远隔离在池子外。
+                if rate_limit_is_soft_shape(detail) and account.mark_verified():
+                    log("account %s: 上游限流（%s）而非拒绝 —— 凭据有效，解除未验证标记"
+                        % (account.uid[:8], rate_limit_code(detail) or "soft-limit"),
+                        level="INFO", tag="accounts")
                 if rate_limit_is_account_level(detail, reset_at):
                     wait = account.note_soft_rate("HTTP 429 (account soft rate)")
                     log("account %s soft-rate limited (%r), cooling %.0fs (streak %d)"
@@ -15863,6 +15870,21 @@ def probe_account(account, model=None, timeout=30):
             row["restricted"] = True
             row["fails"] = int(account.fails)
             return row
+        # 上游认了这个凭据、只是当前限流（429 code 14003「too many requests」
+        # 带 retry_after）：这与 403 11140 是**相反**的证据 —— 前者说明凭据被
+        # 上游接受，后者说明被判非法。实测（2026-10-27 00:19）对两个从未经本网关
+        # 派发过的账号探针，得到的正是 14003 而不是 11140。
+        #
+        # 所以这一条必须解除「未验证」标记：护栏拦的是「凭据可能非法」，而
+        # 14003 恰恰证明它合法。若不解除，这两个号会被永远隔离在池子外 ——
+        # 它们其实只是刚被限流，等窗口过去就能正常服务。
+        if exc.code == 429 and rate_limit_is_soft_shape(detail):
+            if account.mark_verified():
+                log("account %s: 上游限流（%s）而非拒绝 —— 判定凭据有效，"
+                    "解除未验证标记" % (account.uid[:8],
+                                       rate_limit_code(detail) or "soft-limit"),
+                    level="INFO", tag="accounts")
+            row["verified"] = True
         account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
                            cooldown=60, detail=detail)
         row["fails"] = int(account.fails)
@@ -18703,7 +18725,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/0.1.3"
+    server_version = "wb-proxy/0.1.4"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -19425,6 +19447,18 @@ class Handler(BaseHTTPRequestHandler):
             "accounts_ready": POOL.count_ready() if POOL else 0,
             "api_key_required": auth_required(),
         }
+        # 未验证账号的可见性（借鉴 P1-8 的入池闸门）。
+        #
+        # 「有多少个号还没通过上游验证」是**可用性**指标，不是内部细节：
+        # 被护栏隔离的账号不参与派发，等于池子的真实容量比面板上的启用数小。
+        # 不报出来的话，一次「账号被误停/被重新启用」之后，运维看到的就只是
+        # 「可用数变少了」，猜不出原因 —— 实测 2026-10-26 晚的连坐事故正是
+        # 这样被拖到用户自己发现才发现的。
+        if POOL:
+            unverified = POOL.unverified_accounts()
+            info["accounts_unverified"] = len(unverified)
+            info["accounts_upstream_unused"] = sum(
+                1 for a in POOL.accounts if a.upstream_never_consumed())
         if self._key_ok():
             info.update({
                 "uid": rep.uid if rep else None,

@@ -440,11 +440,37 @@ class RestrictionPersistenceTests(unittest.TestCase):
         self.assertEqual(account.restricted_until, 0.0)
         self.assertTrue(account.ready())
 
-    def test_restriction_expires_on_its_own(self):
+    def test_restriction_window_expiry_is_not_enough_to_reenter_the_pool(self):
+        """2 小时冷却到期**不能**让一个被上游判非法的号自动回池（v0.1.4 起）。
+
+        旧语义是「冷却到期即自动回池」。那条语义正是连坐循环的成因：
+        账号被 403 / 11140 判非法 → 冷却 2 小时 → 到期自动回池 → 再次被派发
+        → 再次 11140 → 再触发一次整池 30 分钟连坐暂停。实测 2026-10-26 晚
+        19 个账号的池子里，这样的号有 4 个，全是 `credits.used == 0`（从未被
+        上游消费过）的凭据。
+
+        v0.1.4 的未验证护栏断掉了这个循环：上游判非法是**上游事实**，冷却
+        只决定「多久不要再试」，不等于「上游已经解封」。账号要回池，必须有
+        一条**成功的请求**作为证据（note_success），或一次被上游接受的应答
+        （429 软限流 / 14003 —— 说明凭据有效）。
+
+        对照：冷却本身仍然是限流窗口，throttle_wait 归零 —— 变的是「冷却到期
+        之后能不能自动进池」。
+        """
         account = self._restricted()
         account.restricted_until = time.time() - 1
+        self.assertEqual(account.throttle_wait(), 0.0)   # 限流窗口确实到期了
+        self.assertFalse(account.ready())                # 但仍不回池
+        self.assertTrue(account.is_unverified())
+
+    def test_a_successful_request_reinstates_a_rejected_account(self):
+        """解封的**唯一**证据是一次成功请求 —— 不是时间到了。"""
+        account = self._restricted()
+        account.restricted_until = time.time() - 1
+        self.assertFalse(account.ready())
+        account.note_success()
         self.assertTrue(account.ready())
-        self.assertEqual(account.throttle_wait(), 0.0)
+        self.assertFalse(account.is_unverified())
 
     def test_repeated_detection_does_not_extend_the_window(self):
         account = self._restricted()

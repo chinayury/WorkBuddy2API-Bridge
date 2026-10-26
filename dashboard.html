@@ -8502,6 +8502,7 @@ function accountRow(a){
               ? (a.tasksEnabled
                  ? '<span class="badge off" title="不接 API 流量，但仍参与签到 / 任务">已停用 · 任务中</span>'
                  : '<span class="badge off">已停用</span>')
+              : a.unverified ? '<span class="badge bad" title="' + esc(a.unverifiedReason || '该凭据尚未被上游接受，已隔离，不参与派发') + '。点「测试」验证一次：通过后自动回到池子；被上游判非法（403 / 11140）则需先解封。">未验证</span>'
               : isTokenBad ? '<span class="badge bad" title="登录凭证已失效（上游返回 401 或已过期），请重新登录">凭证失效</span>'
               : a.reserveBlocked ? '<span class="badge warn">保留积分</span>'
               : a.dailyLimitBlocked ? '<span class="badge warn" title="今日已用 ' + fmt(a.dailyTokensToday || 0) + ' / ' + fmt(a.dailyTokenLimit || 0) + ' token，暂停接单（本地 0 点恢复）">日限额</span>'
@@ -8747,6 +8748,15 @@ function disabledRows(){
     if(!a.enabled){
       rows.push({who, realm, scope: '账号', kind: '本地停用', manual: true,
                  reason: '面板手动停用，该账号不参与轮询', until: ''});
+    }
+    // 未验证：该凭据还没被上游接受过（或已被上游判非法），护栏把它隔离在派发
+    // 池外。列在这里是因为它会让「可用账号数」少于「启用账号数」——不列的话，
+    // 运维只能看到数字对不上，猜不出原因（2026-10-26 晚的连坐事故即如此）。
+    if(a.unverified){
+      rows.push({who, realm, scope: '账号', kind: '未验证', manual: true,
+                 reason: a.unverifiedReason
+                   || '该凭据尚未被上游接受，已隔离，不参与派发；点「测试」验证一次即可放行',
+                 until: ''});
     }
     if(a.inCooldown){
       const secs = Number(a.cooldownFor || 0);

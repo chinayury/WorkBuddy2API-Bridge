@@ -1048,6 +1048,43 @@ class Account(object):
         # 只有带重置时刻的 6004 才记——那才是「额度用满」的可判定证据；
         # 其余 429（无重置时刻的软限流）不在这里。记录范围限免费模型
         # （FREE_CAP_MODELS，见 note_model_cap）。
+        # 「从未成功服务过」的账号标记（见 unverified_reason / is_unverified）。
+        #
+        # 上游对**从未被真正激活过的凭据**会在第一次派发时直接判 403 / code 11140
+        # 「账号存在异常行为，已被限制使用」——拒绝发生在**首次触达**，不是慢慢
+        # 积累出来的。实测（2026-10-26 晚，19 账号池）：当晚两次整池连坐
+        # （19:50:47、20:33:22）都��派发到这种账号触发；四个被 11140 的账号
+        # 网关侧成功次数全是 0。而跑过成功的账号从来没被 11140 过。
+        #
+        # 外观完全不能用来判：被封的号和没被封的号，积分水位、签到连续天数、
+        # active 标记看起来一样健康（e73f2aeb 积分 90.2%、连续 17 天，
+        # fd5ba0df 积分 73%、连续 14 天 —— 比很多正常账号还健康）。
+        # 唯一可靠的判据是「网关侧成功记录数」。
+        #
+        # 持久化：判定是**上游事实**，重启后仍然成立。写成 epoch 时刻而不是
+        # 布尔，是为了让面板能说清「从什么时候起没通过验证」。
+        self.unverified_since = 0.0
+        try:
+            self.unverified_since = float(data.get("unverifiedSince") or 0)
+        except (TypeError, ValueError):
+            self.unverified_since = 0.0
+        # 标记的原因（面板要如实说清是「待验证」还是「上游已判非法」）。
+        self.unverified_reason = str(data.get("unverifiedReason") or "")[:200]
+        # 上游**已经接受过**这个凭据的时刻（0 = 从未被接受过）。
+        #
+        # 为什么要有这个字段：mark_verified() 只是把「未验证」标记清掉，可上游
+        # 额度快照的 used 还是 0（上游不一定立刻记账）—— 于是重启后
+        # apply_unverified_guard() 会按 used == 0 把它重新隔离，一个**已经验证
+        # 通过**的号被永远锁在池子外。这是个真实的死锁，必须把「验证过」这个
+        # 事实本身持久下来。
+        #
+        # 它也是「从未被上游激活过」这条判据的例外项：这个字段 > 0 的账号，
+        # 说明上游已经接受过它，无论额度快照怎么显示都不再隔离。
+        self.verified_at = 0.0
+        try:
+            self.verified_at = float(data.get("verifiedAt") or 0)
+        except (TypeError, ValueError):
+            self.verified_at = 0.0
         self.model_caps = {}
         for mid, entry in (data.get("modelCaps") or {}).items():
             if not isinstance(entry, dict):
@@ -1170,6 +1207,14 @@ class Account(object):
             "lastActivityReport": self.last_activity_report,
             # 持久化：6004 的恢复时间是上游给的事实，重启后仍然成立（见 __init__）。
             "modelCaps": {mid: dict(entry) for mid, entry in self.model_caps.items()},
+            # 持久化：「从未成功服务过」的账号标记（见 is_unverified）。上游事实，
+            # 重启后仍然成立 —— 否则一个从没验证过的凭据会在每次重启后又被
+            # 派发一次、再吃一次 403 11140。
+            "unverifiedSince": self.unverified_since,
+            "unverifiedReason": self.unverified_reason,
+            # 持久化：上游已经接受过这个凭据的时刻（0 = 从未）。这是「额度快照
+            # 还没记账」的兜底，避免一个验证通过的号在重启后被重新隔离。
+            "verifiedAt": self.verified_at,
         }
 
     def _throttle_snapshot(self, now):
@@ -1280,6 +1325,18 @@ class Account(object):
                                   and not self.uses_enterprise_billing()),
             "machineId": derive_id(self.uid, "machine"),
             "sessionId": session_id(self.uid),
+            # 「从未成功服务过」：面板据此把账号标成「未验证」，并提示它在通过
+            # 一次验证之前**不会**参与派发。unverifiedFor 是还剩多少秒（0 = 未标记）。
+            "unverified": self.is_unverified(),
+            "unverifiedFor": (round(max(0.0, self.unverified_since - now))
+                              if self.unverified_since else None),
+            "unverifiedSince": int(self.unverified_since) if self.unverified_since else None,
+            "unverifiedReason": self.unverified_reason or None,
+            # 上游额度显示这个凭据从未被消费过：这是「该号可能尚未被上游激活」
+            # 的最强信号（实测 4/4 命中 11140，0/14 误判）。面板用它提示风险。
+            "upstreamUnused": self.upstream_never_consumed(),
+            # 上游已经接受过这个凭据的时刻（0 = 从未）。
+            "verifiedAt": int(self.verified_at) if self.verified_at else None,
         }
 
     def credential_mask(self):
@@ -1730,6 +1787,23 @@ class Account(object):
 
     def ready(self, model=None):
         if not self.enabled or not self.access_token or getattr(self, "token_expired", False):
+            return False
+        # 未验证账号的隔离闸门（借鉴 P1-8 的入池闸门）。
+        #
+        # 上游对**从未被真正激活过**的凭据会在第一次派发时直接判 403 / 11140，
+        # 而 900 秒内两次就触发整池 30 分钟连坐暂停（客户端全拿 429）。实测
+        # 2026-10-26 晚，当晚两次连坐都是这么来的。
+        #
+        # 为什么放在 ready() 的最前面：它挡的是「这个号根本不该接单」，语义上
+        # 优先于所有「暂时不可用」的判断 —— 一个被隔离的号不该因为冷却到期
+        # 或额度刷新就漏进派发池。
+        #
+        # 只认两种「未验证」：
+        #   rejected —— 上游已经明确判非法（403 / 11140），证据确凿；
+        #   pending  —— 上游额度显示这个凭据从未被消费过（used == 0），实测
+        #               4/4 命中 11140、0/14 误判。等待一次显式验证放行。
+        # 被上游接受过（成功服务过，或探针拿到过上游应答）的账号不受影响。
+        if self.unverified_since > 0:
             return False
         # 人工黑名单排在最前：它是静态配置（最便宜），而且在语义上优先于所有
         # 「暂时不可用」的判断 —— 被禁用的模型不该因为账号恰好恢复了就漏进来。
@@ -3411,7 +3485,108 @@ class Account(object):
             # 第一次命中才起算：反复探测/重试不该把 2 小时越推越长。
             if self.restricted_until <= now:
                 self.restricted_until = now + max(1.0, wait)
+        # 上游已经**明确判非法**：这个号不再是「待验证」，而是「已被拒绝」。
+        # 记进护栏（见 is_unverified）—— 否则 2 小时冷却一过，它会重新进池，
+        # 再吃一次 11140，再触发一次整池连坐。实测 2026-10-26 晚，当晚两次
+        # 连坐正是这样一轮轮烧过去的。
+        self.mark_unverified(reason="上游判定该账号非法（HTTP 403 / 11140）")
         return self.restricted_until
+
+    # -------------------------------------------------- 未验证账号（11140 护栏）
+
+    # 未验证状态的三态（借鉴 CangShui/workbuddy-gateway 的 credverify.go 三态契约：
+    # 「明确拒绝」与「无法判定」必须分开，否则一次网络抖动就会误杀还能用的号）。
+    # 本项目的取值与上游实测一一对应：
+    #   VERIFIED   —— 上游已经接受过这个凭据（跑成过一次，或探针拿到过上游应答）
+    #   REJECTED   —— 上游明确判非法：HTTP 403 / code 11140「账号存在异常行为」
+    #   UNVERIFIED —— 还没验证过：从未有过成功记录，且上游从未消费过它
+    UNVERIFIED_NONE = ""
+    UNVERIFIED_PENDING = "pending"   # 未验证：可能被上游判非法，先隔离
+    UNVERIFIED_REJECTED = "rejected"  # 上游已明确判非法
+
+    def upstream_never_consumed(self):
+        """上游的额度快照显示这个账号**从未被消费过**（used == 0）。
+
+        这是判别「凭据从未被上游真正激活」最准的一条信号，实测分离度是完美的：
+
+        - `credits.used == 0` 的 5 个账号里，4 个已被上游 403 / 11140 判非法
+          （31ab6921 / 3cfa1fab / c9e676e7 / d667a85d）；
+        - `credits.used > 0` 的 14 个账号里，**零个**被判过 11140。
+
+        相比「网关侧成功次数 == 0」这条判据，它更准：后者会把 5 个
+        「有上游消费历史、只是没经本网关派发过」的号误判成炸弹
+        （e73f2aeb / f45878a9 / f630e6c4 / f7102b2e / fd5ba0df）。
+
+        额度快照缺失时返回 False —— 拿不到证据不等于有罪，宁可放过也不误伤。
+
+        **已被上游接受过的账号一律不算**：上游不一定立刻把这次消费记进额度
+        快照，所以一个刚验证通过的号，其 used 可能仍是 0。这种情况由
+        `verified_at` 兜住（见 __init__ 里的说明）。
+        """
+        if self.verified_at > 0:
+            return False
+        credits = self.credits if isinstance(self.credits, dict) else None
+        if not credits:
+            return False
+        try:
+            used = float(credits.get("used"))
+        except (TypeError, ValueError):
+            return False
+        return used <= 0.0
+
+    def is_unverified(self):
+        """这个账号是不是「还没通过上游验证」？
+
+        上游对**从未被真正激活过的凭据**会在第一次派发时直接判 403 / code 11140
+        「账号存在异常行为，已被限制使用」。拒绝发生在**首次触达**：不是慢慢积累
+        出来的，而是这一号从来没被上游真正激活过，第一次带上就判非法。
+
+        实测（2026-10-26 晚，19 账号池）：当晚两次整池连坐（19:50:47、20:33:22）
+        都是派发到这种账号触发的。四个被 11140 的账号（31ab6921 / 3cfa1fab /
+        c9e676e7 / d667a85d）上游额度全是「一消费未过」（used == 0）；
+        而跑过成功的账号**一次都没被** 11140 过。
+
+        **外观不能用来判**：被封的号和没被封的号，积分水位、签到连续天数、
+        active 标记看起来一样健康（e73f2aeb 积分 90.2%、连续 17 天；fd5ba0df
+        积分 73%、连续 14 天 —— 比很多正常账号还健康）。source 也不是判据
+        （fd5ba0df 是 oauth 一样中招）。
+
+        判定依据两条，都取自上游事实：
+        - `upstream_never_consumed()`：上游额度显示这个凭据从未被激活过；
+        - 上游已经回过一次 403 / 11140（note_restricted 之后）。
+        """
+        return self.unverified_since > 0
+
+    def mark_unverified(self, reason=None, now=None):
+        """记下「这个号还没通过上游验证 / 上游已判非法」，返回标记时刻。
+
+        第一次标记才记时刻：反复探测不该把「从什么时候起没通过验证」一直往后推。
+        reason 会原样落进面板，让操作者知道是「待验证」还是「已被上游判非法」。
+        """
+        moment = float(now if now is not None else time.time())
+        with self._throttle_lock:
+            if self.unverified_since <= 0:
+                self.unverified_since = moment
+            if reason:
+                self.unverified_reason = str(reason)[:200]
+        return self.unverified_since
+
+    def mark_verified(self):
+        """一次真实成功（或一次被上游接受的应答）之后解除标记。
+
+        这是唯一的解除条件 —— 「上游接受过它」是**上游事实**，不是本地推断。
+
+        同时记下 `verified_at`：这个事实要持久下来，否则上游额度快照的 used
+        还没更新（仍是 0）时，重启后的 apply_unverified_guard() 会把这个
+        **已经验证通过**的号重新隔离 —— 一个永远锁在池子外的死锁。
+        """
+        with self._throttle_lock:
+            was = self.unverified_since > 0
+            self.unverified_since = 0.0
+            self.unverified_reason = ""
+            if self.verified_at <= 0:
+                self.verified_at = time.time()
+        return was
 
     def note_balance_cooled(self, message="insufficient credits"):
         """402 / out of credits: park until the next local 04:00.
@@ -3560,6 +3735,10 @@ class Account(object):
             self.last_error_detail = ""
             self.cooldown_until = 0.0
             self.token_expired = False
+        # 上游真的把这个号服务出去了：这是「凭据被上游接受」的直接证据，
+        # 护栏据此解除（见 mark_verified / is_unverified）。这是唯一的解除条件
+        # —— 本地推断不能替代上游事实。
+        self.mark_verified()
 
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
@@ -4011,7 +4190,46 @@ class AccountPool(object):
             # 凭证档的 modelCaps，读不到它。不补这一次，重启后这些窗口就只对
             # 探针可见：池子照常派单（每单再吃一次 429），面板「当前禁用」也空着。
             self.restore_window_cooldowns()
+            self.apply_unverified_guard()
             return self.accounts
+
+    def apply_unverified_guard(self, now=None):
+        """按上游事实给「从未被激活过」的账号打未验证标记。
+
+        判据是 `credits.used == 0`（上游额度显示这个凭据从未被消费过），
+        实测分离度是完美的：used==0 的 5 个账号里 4 个已被上游 403/11140 判非法，
+        used>0 的 14 个账号零触发。
+
+        与「网关侧成功次数 == 0」相比，它更准：后者会把 5 个「有上游消费历史、
+        只是没经本网关派发过」的号误判成炸弹。
+
+        **只打标、不改 enabled**：是否派发由 `Account.ready()` 决定，操作者
+        在面板上看到的启用状态保持原样 —— 这条护栏拦的是「派发」，不是
+        「状态」，所以不会让面板显示与磁盘不一致。
+
+        已经验证过的号（跑成过一次）不受影响：它们的 used 通常 > 0，
+        即便 used 仍是 0，只要 unverified_since 已被一次成功清掉，也不重打。
+        """
+        now = time.time() if now is None else now
+        marked = []
+        with self._lock:
+            for account in self.accounts:
+                if account.unverified_since > 0:
+                    continue
+                if not account.upstream_never_consumed():
+                    continue
+                account.mark_unverified(
+                    reason="上游额度显示该凭据从未被消费过（尚未被上游激活）", now=now)
+                marked.append(account.uid)
+        for uid in marked:
+            self.log("account %s: 上游额度显示从未被消费过 —— 标记为未验证，"
+                     "在通过一次验证之前不参与派发（避免 403 11140 连坐）" % uid[:8])
+        return marked
+
+    def unverified_accounts(self):
+        """当前被护栏隔离的账号（uid 列表）。"""
+        with self._lock:
+            return [a.uid for a in self.accounts if a.is_unverified()]
 
     def restore_model_caps(self, now=None):
         """把仍在恢复时间内的 6004 挂回每个账号的模型冷却上。"""
