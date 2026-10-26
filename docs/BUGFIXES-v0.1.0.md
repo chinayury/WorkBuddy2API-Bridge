@@ -102,6 +102,30 @@
 > **U2 的开关默认关**：这是本项目对「行为变更」的一贯取舍 —— 新能力默认不改变既有行为，
 > 由运维在设置页显式开启。升级后不开这个开关，国际版每日活跃的失败表现与升级前完全一致。
 
+### 2.6 账号池治理：冷账号停用 + 已验证账号恢复（2026-10-26 晚，非代码修复）
+
+这不是代码 BUG，而是**部署侧配置治理**，记录在此以免下次重复踩。
+
+| # | 问题 | 现象 | 根因 | 处置 |
+|---|---|---|---|---|
+| P1 | **冷账号仍留在派发池** | 客户端连续收到 429，日志 `upstream account restriction in effect`；两次连坐（19:50:47、20:33:22）整池暂停 1800s | 19 个账号里 **9 个从未成功服务过**（`usage.jsonl` 中 `completed` 次数 = 0）。上游对这些「从未被激活的凭证」判「异常行为」→ 403 11140 → 账号冷却 2h → 900s 内 2 次即触发整池连坐 | **停用 9 个冷账号**。派发只走 `enabled=True`（`pick_account` 要求 `a.enabled and a.access_token and a.ready(model)`），停用即消除炸弹，**容量不降反升** |
+| P2 | **已验证可服务的账号被误停用** | 可派发账号一度只剩 5 个 | 批量停用时把「成功 16~54 次」的正常账号一起停了 | **恢复 5 个**（有 `completed` 记录且 `restrictedFor = 0`）。池子恢复到 10 个可用 |
+| P3 | **超长会话持续膨胀上下文** | 单账号 12h 烧掉 159.8 万 token（第二名才 3633）；会话 in-token 达 6.6 万且在涨 | 用户会话一直不重开，上下文每轮累积 | 需**开新会话**（客户端侧操作，网关无法代劳）。已加巡检告警：启用账号积分余量 < 20% 即报 |
+
+**判据**（脚本 `ops-scripts/disable_remaining_cold.sh` / `restore_verified_accounts.sh`）：
+
+| 类别 | 判据 | 动作 |
+|---|---|---|
+| 冷账号 | `usage.jsonl` 中 `completed` = 0 | 停用 |
+| 已验证可服务 | 有 `completed` 记录 **且** `restrictedFor = 0` | 可恢复启用 |
+| 11140 受限 | `restrictedFor > 0` | 保持停用，等冷却到期再评估 |
+
+**易混口径**：面板的 `inCooldown` / `restrictedFor` 与磁盘的 `enabled` 是两回事
+——`enabled=False` 的账号仍会出现在 `inCooldown` 列表里；
+判「冷账号」要看 `usage.jsonl` 的 `completed` 计数，不是看 `enabled`。
+
+**回滚点**：`/opt/workbuddy2api-hub/backups/accounts-before-{cold-disable,cold-disable2,restore}-*.tar.gz`。
+
 ---
 
 ## 三、已回退（审计提出但经回归证明是上游刻意设计）
