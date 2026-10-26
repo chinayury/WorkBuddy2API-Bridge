@@ -216,7 +216,37 @@ class Scheduler:
             # 模型额度定时主动查询：同样不受 enabled 影响——它是「哪些配额线
             # 已经打满」的唯一主动信息源，跟签到/保活不是一回事。
             self._run_quota_scans()
+            # 账号池可用性巡检（v0.1.5 新增）：可派发账号数跌到阈值以下时
+            # 主动告警。这是「池子被做空了」的唯一主动信号 —— 2026-10-26 晚
+            # 两次事故都是靠人写的一次性脚本才发现的，网关自己一声不吭。
+            # 挂在这里而不是新开线程：这个循环本来就在跑。
+            try:
+                self._check_pool_health()
+            except Exception as exc:
+                pass
             self._stop_event.wait(self._next_wait())
+
+    def _check_pool_health(self):
+        """池子可用性检查 → 告警（阈值型，去抖在 wb_alerts 里）。
+
+        判据用「**可派发**账号数」：v0.1.4 的未验证护栏让 enabled=True 的
+        账号也可能不参与派发，只看启用数会高估容量。
+        """
+        if not self.pool or not self.pool.accounts:
+            return
+        try:
+            import wb_alerts
+        except Exception:
+            return
+        accounts = list(self.pool.accounts)
+        enabled = [a for a in accounts if a.enabled]
+        isolated = [a for a in enabled if a.is_unverified()]
+        dispatchable = len(enabled) - len(isolated)
+        try:
+            wb_alerts.check_pool(self.pool.dir, dispatchable, len(accounts),
+                                 enabled=len(enabled), isolated=len(isolated))
+        except Exception:
+            pass
 
     def _run_window_probes(self):
         """在独立线程里执行到点的窗口探针。

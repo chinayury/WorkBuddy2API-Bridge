@@ -52,6 +52,7 @@ pricing/pricing.json
 wb_accounts.py
 wb_activity.py
 wb_agents.py
+wb_alerts.py
 wb_atomic.py
 wb_atrest.py
 wb_catalog.py

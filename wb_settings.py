@@ -147,6 +147,45 @@ ACCOUNT_MAX_CONCURRENT_KEY = "account_max_concurrent"
 #: 上限值域：0 = 不限；1..10 是「每账号同时几个」。10 只是防手滑的上界。
 ACCOUNT_MAX_CONCURRENT_MAX = 10
 
+#: 告警配置（webhook / ServerChan / 阈值）。见 wb_alerts.py。
+#:
+#: 存在 settings.json 里（而不是账号档），因为它是**网关级**配置而不是某个账号的
+#: 状态；且它含 secret —— settings.json 的权限是 0600（save() 里 wb_atomic.tighten_mode
+#: 收紧），与 API Key 同一把锁。
+ALERTS_KEY = "alerts"
+
+
+def alerts(accounts_dir):
+    """读告警配置的**公开视图**（不含 secret / key）。
+
+    面板回读用这个：只告诉用户「配没配」，绝不给 secret 本身。
+    """
+    raw = load(accounts_dir).get(ALERTS_KEY)
+    if not isinstance(raw, dict):
+        return {"webhook": False, "serverchan": False, "thresholds": {}}
+    hook = raw.get("webhook")
+    sc = raw.get("serverchan")
+    th = raw.get("thresholds")
+    return {
+        "webhook": bool(isinstance(hook, dict) and str(hook.get("url") or "").strip()),
+        "serverchan": bool(isinstance(sc, dict) and str(sc.get("key") or "").strip()),
+        "thresholds": (dict(th) if isinstance(th, dict) else {}),
+    }
+
+
+def set_alerts(accounts_dir, value):
+    """写告警配置。空 dict = 全部关闭（清掉 webhook 与 ServerChan）。"""
+    if not isinstance(value, dict):
+        raise ValueError("alerts must be an object")
+    with _lock:
+        data = load(accounts_dir)
+        if value:
+            data[ALERTS_KEY] = value
+        else:
+            data.pop(ALERTS_KEY, None)
+        save(accounts_dir, data)
+    return alerts(accounts_dir)
+
 
 def account_max_concurrent(accounts_dir):
     """How many chat requests one upstream account may run at once.

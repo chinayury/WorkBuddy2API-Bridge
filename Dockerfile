@@ -1,7 +1,7 @@
-# WorkBuddy2API-Hub v0.1.4 —— 本地补丁镜像
+# WorkBuddy2API-Hub v0.1.5 —— 本地补丁镜像
 #
 # 用途：环境**能**访问 Docker Hub 时，用这个自包含的 Dockerfile 从零构建。
-#   docker build -t workbuddy2api-hub:0.1.4 .
+#   docker build -t workbuddy2api-hub:0.1.5 .
 #
 # 依赖：不需要 pip install（项目零第三方依赖），只需拉一个 python 基础镜像。
 #

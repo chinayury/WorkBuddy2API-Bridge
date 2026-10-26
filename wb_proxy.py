@@ -62,6 +62,7 @@ def _env_float(name, default, minimum=0.0):
 import uuid
 import wb_accounts
 import wb_activity
+import wb_alerts
 import wb_atrest
 import wb_catalog
 import wb_egress
@@ -10190,6 +10191,9 @@ def runtime_settings_view():
         "model_daily_token_limit": wb_settings.model_daily_token_limit(ACCOUNTS_DIR),
         "pricing_refresh_minutes": wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR),
         "credits_refresh_hours": wb_settings.credits_refresh_hours(ACCOUNTS_DIR),
+        # 告警配置与投递状态。**不含 secret** —— wb_settings.alerts 只回「配没配」。
+        "alerts": wb_settings.alerts(ACCOUNTS_DIR),
+        "alerts_status": wb_alerts.status(),
         "section_max_height": wb_settings.section_max_height(ACCOUNTS_DIR),
         "schedule": dict(wb_settings.schedule_hours(ACCOUNTS_DIR),
                          daily_chat=wb_settings.daily_chat_times(ACCOUNTS_DIR),
@@ -10274,7 +10278,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "0.1.4",
+        "version": "0.1.5",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -14734,6 +14738,19 @@ def note_account_restriction(realm, uid="", now=None):
         "pausing dispatch for %.0fs to avoid cross-account bans (uid %s)"
         % (realm, len(events), RESTRICTION_WAVE_WINDOW,
            RESTRICTION_HOLD_SECONDS, uid[:8]))
+    # 告警：整池暂停是**客户端立刻拿 429** 的事件，必须让运维知道，
+    # 而不是等用户来问。失败不影响上面的保护逻辑（emit 自己吞异常）。
+    try:
+        wb_alerts.emit(ACCOUNTS_DIR, wb_alerts.EV_RESTRICTION_WAVE, {
+            "realm": realm,
+            "restricted_accounts": sorted(u[:8] for u in events),
+            "count": len(events),
+            "hold_seconds": int(RESTRICTION_HOLD_SECONDS),
+            "resume_at": time.strftime("%Y-%m-%d %H:%M:%S",
+                                       time.localtime(until)),
+        }, for_ticks=1, clear_ticks=1, key="restriction_wave:%s" % realm, hit=True)
+    except Exception:
+        pass
     return until
 
 
@@ -18725,7 +18742,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/0.1.4"
+    server_version = "wb-proxy/0.1.5"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -20329,6 +20346,44 @@ class Handler(BaseHTTPRequestHandler):
                 wb_settings.set_credits_refresh_hours(ACCOUNTS_DIR, hours)
             if CREDITS_REFRESHER:
                 CREDITS_REFRESHER.wake()
+        if "alerts" in payload:
+            # 告警配置（webhook / ServerChan）。secret 与 key 都**只写不读**：
+            # 面板回读时用掩码占位，留空表示「保持原值」，与 API Key 同款契约。
+            raw = payload.get("alerts")
+            if not isinstance(raw, dict):
+                return self._error(400, "alerts must be an object",
+                                   "invalid_request_error")
+            current = wb_alerts.config(ACCOUNTS_DIR)
+            out = {}
+            hook = raw.get("webhook")
+            if isinstance(hook, dict):
+                url = str(hook.get("url") or "").strip()
+                secret = str(hook.get("secret") or "").strip()
+                if not secret:
+                    secret = (current.get("webhook") or {}).get("secret", "")
+                if url or secret:
+                    out["webhook"] = {"url": url, "secret": secret}
+            sc = raw.get("serverchan")
+            if isinstance(sc, dict):
+                key = str(sc.get("key") or "").strip()
+                if not key:
+                    key = (current.get("serverchan") or {}).get("key", "")
+                if key:
+                    out["serverchan"] = {"key": key}
+            th = raw.get("thresholds")
+            if isinstance(th, dict):
+                out["thresholds"] = {
+                    "min_ready": max(1, int(th.get("min_ready") or 8)),
+                    "for_ticks": max(1, int(th.get("for_ticks") or 2)),
+                    "clear_ticks": max(1, int(th.get("clear_ticks") or 2)),
+                }
+            wb_settings.set_alerts(ACCOUNTS_DIR, out)
+            # 回读只给「配没配」，不给 secret 本身。
+            reply["alerts"] = {
+                "webhook": bool(out.get("webhook", {}).get("url")),
+                "serverchan": bool(out.get("serverchan", {}).get("key")),
+                "thresholds": out.get("thresholds") or {},
+            }
         if "section_max_height" in payload:
             # Panel window height cap in pixels; 0 turns the cap off. bool is an
             # int subclass and must be rejected explicitly - true would
@@ -21876,6 +21931,34 @@ class Handler(BaseHTTPRequestHandler):
             "atrest": wb_atrest.status(),
         })
 
+    def _route_alerts_test(self):
+        """面板的「发送测试通知」：立刻投一次，把结果如实回给操作者。
+
+        与后台告警不同，这条**同步**返回 —— 操作者点了按钮要知道成没成，
+        失败原因（URL 不对 / 签名不匹配 / 网络不通）也得看得见。
+        超时上限 8 秒（wb_alerts.HTTP_TIMEOUT），不会把面板请求挂死。
+        """
+        cfg = wb_alerts.config(ACCOUNTS_DIR)
+        if not cfg:
+            return self._error(400, "尚未配置任何告警通道（webhook 或 ServerChan）",
+                               "invalid_request_error")
+        try:
+            ok, err = wb_alerts._deliver(cfg, "test", {
+                "message": "这是一条来自 WorkBuddy2API-Hub 面板的测试通知",
+                "ready": POOL.count_ready() if POOL else 0,
+                "accounts": len(POOL.accounts) if POOL else 0,
+            })
+        except Exception as exc:
+            return self._error(500, "测试发送失败: %s" % exc)
+        if not ok:
+            return self._error(502, "测试发送失败: %s" % (err or "未知错误"))
+        channels = []
+        if cfg.get("webhook"):
+            channels.append("webhook")
+        if cfg.get("serverchan"):
+            channels.append("serverchan")
+        return self._json(200, {"ok": True, "detail": "已投递到 " + ", ".join(channels)})
+
     def _route_accounts_refresh(self, payload):
         uid = payload.get("uid")
         targets = [POOL.get(uid)] if uid else list(POOL.accounts)
@@ -22006,6 +22089,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(404, "no such account")
             log("account %s %s"
                 % (uid[:8], "enabled" if payload.get("enabled") else "disabled"))
+            # 启用「上游从未消费过」的账号 = 把一颗 11140 炸弹装回派发池。
+            # 2026-10-26 晚到 10-27 凌晨的两次事故都是这么来的：面板上的一次
+            # 「启用」把零成功账号放回池子，而它每次被派发都可能触发 403 11140，
+            # 900 秒内两次就触发整池 30 分钟连坐暂停。
+            # v0.1.4 的护栏会拦下它（不参与派发），但**启用这个动作本身**
+            # 值得通知运维一声 —— 「谁在什么时候把什么装回来了」。
+            if payload.get("enabled"):
+                try:
+                    account = POOL.get(uid)
+                    if account is not None and account.upstream_never_consumed():
+                        wb_alerts.emit(ACCOUNTS_DIR,
+                                      wb_alerts.EV_UNVERIFIED_REARMED, {
+                            "uid": (uid or "")[:8],
+                            "nickname": account.nickname,
+                            "reason": "上游额度显示该凭据从未被消费过；"
+                                      "已启用但被未验证护栏隔离，不参与派发",
+                            "weight": account.weight,
+                        }, for_ticks=1, clear_ticks=1,
+                            key="unverified_rearm:%s" % (uid or "")[:8], hit=True)
+                        log("account %s: 启用了一个上游从未消费过的账号"
+                            " —— 已隔离不参与派发，但请确认它是否已被上游激活",
+                            (uid or "")[:8], level="WARN", tag="accounts")
+                except Exception:
+                    pass
         if "tasksEnabled" in payload:
             updated = POOL.set_tasks_enabled(uid, bool(payload.get("tasksEnabled")))
             if updated is None:
@@ -22751,6 +22858,12 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/alerts/test":
+            # 面板的「发送测试通知」：直接走一次投递，把投递结果如实回给操作者。
+            # 面板门（_panel_ok）挡住未授权调用 —— 这条会向外部地址发请求。
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_alerts_test()
         if path == "/updates/check":
             # Panel-only management write, like the pricing ones. No body to
             # read: the action takes no parameters, so a button that posts
