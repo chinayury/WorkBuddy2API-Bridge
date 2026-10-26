@@ -10266,7 +10266,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "0.1.0",
+        "version": "0.1.2",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -11626,6 +11626,107 @@ def strip_data_prefix(line):
     if not line or line.startswith(":"):
         return ""
     return line
+def _call_payload_is_empty(payload):
+    """True when a tool-call payload carries neither a name nor any argument text.
+
+    上游把一次工具调用拆成多帧发：头帧带 id/type/name，后续帧只带 arguments
+    分片（function.name 是空串）。把「name 为空」当成占位噪音处理，会把承载
+    参数的那些帧整帧删掉 —— 客户端于是只收到一个 arguments 为空的头帧，
+    参数从此丢失，agent 侧表现为「缺少必填参数」。
+
+    真正的空占位是「既没有函数名、也没有任何参数文本」。
+    """
+    if isinstance(payload, dict):
+        fn = payload.get("function")
+        if not isinstance(fn, dict):
+            fn = payload
+    else:
+        return not payload
+    name = fn.get("name")
+    if isinstance(name, str):
+        name = name.strip()
+    elif name is None:
+        name = ""
+    else:
+        name = str(name).strip()
+    args = fn.get("arguments")
+    if args is None:
+        args = fn.get("parameters")
+    if isinstance(args, str):
+        has_args = bool(args.strip())
+    elif args is None:
+        has_args = False
+    else:
+        has_args = bool(args)
+    return not name and not has_args
+
+
+def _normalize_tool_call_frames(delta, seen):
+    """整理流式工具调用帧：删掉真占位，并保证**函数名只出现一次**。
+
+    上游把一次工具调用拆成多帧：头帧带 id/type/name，后续帧只带 arguments 分片
+    （function.name 是空串）。这里要一起处理两个坑：
+
+    1) 「name 为空 = 占位」的过滤会把承载参数的分片帧整帧删掉 → 客户端只收到
+       arguments 为空的头帧，参数从此丢失（agent 侧报「缺少必填参数」）。
+    2) **函数名必须整段流里只出现一次**。两种客户端对 name 的处理方式正好相反：
+       OpenAI SDK 是「name 不为 None 就覆盖」（空串会把真名抹掉），而按 name
+       累加的客户端会把每次出现的名字接成一长串（实测 5 个并行的 TaskCreate 被
+       累成 "TaskCreateTaskCreate…"，客户端据此找不到工具，报 Tool Not Found，
+       整轮 agent 直接失败、界面永远停在「思考中」）。
+
+       ⇒ 唯一两边都对的形状就是 OpenAI 原生流式的样子：**头帧带 name，续帧整个
+         不带 name 键**。所以不是把空名字「回填」成真名，而是**把续帧上的 name
+         键整个删掉**。
+
+    `seen` 是本次请求的 {tool index -> 已知函数名} 记忆。
+    返回是否有改动。
+    """
+    tcs = delta.get("tool_calls")
+    if not isinstance(tcs, list) or not tcs:
+        return False
+    kept = []
+    changed = False
+    for tc in tcs:
+        if _call_payload_is_empty(tc):
+            changed = True
+            continue
+        if isinstance(tc, dict):
+            fn = tc.get("function")
+            if isinstance(fn, dict):
+                idx = tc.get("index")
+                name = fn.get("name")
+                has_name = isinstance(name, str) and bool(name.strip())
+                has_id = bool(tc.get("id"))
+                if has_name and has_id:
+                    # 头帧：名字在这里出现，也只在这里出现。
+                    seen[idx] = name
+                elif not has_name:
+                    # 续帧：上游把 name 置空 → 把 name 键整个删掉，而不是回填真名。
+                    # 回填会让「按 name 累加」的客户端把名字接成一长串
+                    # （实测 5 个并行 TaskCreate 累成 TaskCreateTaskCreate…，
+                    #  客户端据此找不到工具，报 Tool Not Found，整轮 agent 失败）。
+                    if "name" in fn:
+                        fn.pop("name", None)
+                        changed = True
+                elif idx not in seen:
+                    # 没有 id 却带着真名，且这个 index 还没出现过 ——
+                    # 这是唯一一处能拿到名字的地方，留着。
+                    seen[idx] = name
+                else:
+                    # 续帧重复带名字：删掉，否则按 name 累加的客户端会拼成一串。
+                    fn.pop("name", None)
+                    changed = True
+        kept.append(tc)
+    if len(kept) != len(tcs):
+        changed = True
+        if kept:
+            delta["tool_calls"] = kept
+        else:
+            delta.pop("tool_calls", None)
+    return changed
+
+
 def clean_chunk(raw):
     """Drop the empty noise fields the WorkBuddy gateway pads deltas with."""
     try:
@@ -11653,12 +11754,7 @@ def clean_chunk(raw):
         # 改为显式检查：name 与 arguments 均空才视为占位噪音。
         fc = delta.get("function_call")
         if fc is not None:
-            fc_empty = False
-            if isinstance(fc, dict):
-                fc_empty = not fc.get("name")
-            else:
-                fc_empty = not fc
-            if fc_empty:
+            if _call_payload_is_empty(fc):
                 delta.pop("function_call", None)
                 changed = True
         tc_list = delta.get("tool_calls")
@@ -11671,10 +11767,13 @@ def clean_chunk(raw):
                 # 占位。非流式路径（aggregate_stream）有这道过滤，流式路径原来
                 # 没有 —— 同一条对话在流式与非流式下给出的工具调用不一样，
                 # OpenAI SDK 拿到没有 name 的 tool_call 会直接抛错。
-                real = [tc for tc in tc_list
-                        if not (isinstance(tc, dict)
-                                and isinstance(tc.get("function"), dict)
-                                and not (tc["function"].get("name") or ""))]
+                #
+                # 但「name 为空」不等于「占位」：流式上游把参数拆成多帧发，后续帧
+                # 的 function.name 为空、只有 arguments。按 name 判空会把承载参数的
+                # 那一帧整帧删掉，客户端于是只收到 arguments 为空的头帧，参数从此
+                # 丢失（agent 侧报「缺少必填参数」）。只有既没有函数名、也没有任何
+                # 参数文本的帧才是真占位。
+                real = [tc for tc in tc_list if not _call_payload_is_empty(tc)]
                 if len(real) != len(tc_list):
                     changed = True
                     if real:
@@ -11702,7 +11801,7 @@ def _strip_empty_fc(obj):
     changed = False
     if isinstance(obj, dict):
         fc = obj.get("function_call")
-        if isinstance(fc, dict) and not fc.get("name"):
+        if isinstance(fc, dict) and _call_payload_is_empty(fc):
             obj.pop("function_call", None)
             changed = True
         tc = obj.get("tool_calls")
@@ -18480,7 +18579,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/0.1.0"
+    server_version = "wb-proxy/0.1.2"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -22792,6 +22891,10 @@ class Handler(BaseHTTPRequestHandler):
             leak_filter = LeakedToolCallStreamFilter()
             synthesized_calls = False
             pending_finish = None
+            # 每个 choice 一份 {tool index -> function name}：流式上游只在头帧给
+            # 函数名，参数分片帧的名字是空的，要靠这里回填（见
+            # _normalize_tool_call_frames 的说明）。
+            tool_call_names = {}
             # 写出缓冲：一个读取块里的事件合成一次 write。
             # wfile 是 wbufsize=0 的**无缓冲**文件（StreamRequestHandler 默认），
             # 每个 chunk 直接落成一次 sendall —— 一次 syscall 加一次 GIL 交还。
@@ -22860,8 +22963,13 @@ class Handler(BaseHTTPRequestHandler):
                                 # then ends without billable usage. Re-emitted once
                                 # below, after the finish frame.
                                 maybe.pop("usage", None)
-                            for ch in (maybe.get("choices") or []):
+                            for choice_idx, ch in enumerate(maybe.get("choices") or []):
                                 delta = ch.get("delta") or {}
+                                # 工具调用帧：删真占位 + 回填函数名。必须在
+                                # clean_chunk 之前做，否则参数分片帧会被占位
+                                # 过滤整帧删掉（客户端只拿到空 arguments）。
+                                _normalize_tool_call_frames(
+                                    delta, tool_call_names.setdefault(choice_idx, {}))
                                 if delta.get("reasoning_content"):
                                     streamed_text.append(delta["reasoning_content"])
                                 piece = delta.get("content")
