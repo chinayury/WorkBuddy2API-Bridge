@@ -33,6 +33,9 @@ dist/
 .sdk-cache/
 wrt/ipk/
 wrt/apk/
+# 打好的发布包不进仓库（会被下一次打包重新套进新包里）
+*.tar.gz
+*.tar.gz.*
 # build-apk.sh 把 wb_*.py 暂存进包目录再拷给 SDK，这是构建中间产物
 wrt/openwrt/workbuddy2api/files/usr/lib/
 
