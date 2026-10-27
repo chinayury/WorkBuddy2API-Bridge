@@ -103,6 +103,15 @@ done
 `Dockerfile.local` 是 `FROM <官方镜像 digest> + COPY wb_*.py dashboard.html ./`，
 **覆盖全部应用模块**（通配符自动包含新增模块，不需要改 Dockerfile）。
 
+> **「33 个文件」怎么来的，别数错**：上面那条 `for` 循环校验的是
+> `wb_*.py`（32 个）+ `dashboard.html`（1 个）= **33 个文件**。
+> 发布树根目录另有 `console_tail.py`，它是 **Windows 便携包专用**的工具
+> （`start-wb-proxy.bat` 用 `pythonw` 静默起服务、再由它开一个日志窗口），
+> Linux 容器不需要，因此 **不进镜像、不参与 sha 校验** —— 这是设计如此，不是漏拷。
+> 核对方式：`ls wb_*.py | wc -l` 应为 32；容器内 `ls /app/*.py | wc -l` 应同为 32。
+> 反过来，`release/` 目录里的 `.py` 总数是 33（含 `console_tail.py`），
+> 与「校验 33 个文件」不是一回事，别混着数。
+
 > 为什么不建议在本地构建镜像：构建负载压在工作站上会拖垮它（实测曾导致整机重启、
 > 后台任务丢失）。本地只做源码编辑与推送，镜像在部署服务器上构建。
 

@@ -208,6 +208,11 @@ chmod 600 /opt/workbuddy2api-hub/.env
 socket / threading / time / urllib）+ 本地 `wb_settings`。**「没有可被投毒的依赖链」
 这个结论在 v0.1.6 依然成立。**
 
+> **口径说明**：上表的「`.py` 模块数」是 **发布树根目录的 `.py` 文件总数**（v0.1.6 = 33）。
+> 其中 32 个是 `wb_*.py`（进镜像、参与逐文件 sha 校验），第 33 个是
+> `console_tail.py` —— Windows 便携包的日志窗口工具，Linux 容器不使用、不进镜像。
+> 别把这个 33 与部署侧「校验 33 个文件」（= 32 个 `wb_*.py` + `dashboard.html`）混为一谈。
+
 ### 9.2 本轮新引入的高危问题：SSRF（已修复）
 
 **问题**：v0.1.5 的告警通道让网关能向**面板用户填写的任意 URL** 发 HTTP 请求，
