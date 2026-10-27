@@ -170,6 +170,13 @@ class AlertsDeliveryTest(unittest.TestCase):
         self.assertEqual(parsed["payload"]["ready"], 3)
 
     def test_delivery_failure_is_reported_not_raised(self):
+        """投递失败要**报出来**，但不能带出响应体。
+
+        v0.1.6 安全加固：webhook URL 是面板用户填的，网关会真的去请求它。
+        urllib 的异常 `str(exc)` 里带**响应正文** —— 直接回显给面板，
+        就是一条「让网关代读内网资源」的通道（SSRF 读）。
+        ⇒ 错误文本只保留异常类型与状态码。
+        """
         def boom(url, body, headers=None, timeout=None):
             raise RuntimeError("network down")
 
@@ -177,7 +184,9 @@ class AlertsDeliveryTest(unittest.TestCase):
         cfg = wb_alerts.config(self.tmp)
         ok, err = wb_alerts._deliver(cfg, "test", {})
         self.assertFalse(ok)
-        self.assertIn("network down", err)
+        # 仍然报告了失败，但**不含**原始异常文本
+        self.assertIn("webhook", err)
+        self.assertNotIn("network down", err)
 
     def test_check_pool_uses_dispatchable_count(self):
         """判据是「可派发」数，不是启用数 —— 护栏隔离的号不算容量。"""

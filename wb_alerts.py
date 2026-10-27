@@ -33,9 +33,11 @@
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import queue
+import socket
 import threading
 import time
 import urllib.error
@@ -171,10 +173,151 @@ def _sign(secret, body):
 
 
 def _post(url, body, headers=None, timeout=HTTP_TIMEOUT):
+    """向 webhook 发一次 POST。
+
+    **只允许 http/https**，且**不回显响应体**：这条 URL 由面板用户填，网关会
+    真的去请求它。不限制 scheme 就能用 `file://` 读本地文件；把响应体带回来
+    就成了「让网关代读内网资源」的通道（SSRF 读）。详见 `_assert_webhook_url`。
+
+    **不跟随跳转**：默认 opener 带 `HTTPRedirectHandler`，一个公网 URL 用 302
+    跳到 `http://127.0.0.1:8788/` 就能绕过字符串级的地址检查。
+    """
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read(4096)
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    with opener.open(req, timeout=timeout) as resp:
+        # 只读状态码与长度，不读正文 —— 正文可能正是内网服务的敏感内容。
+        try:
+            resp.read(1)
+        except Exception:
+            pass
+        return b""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """拒绝一切跳转：跳转目标可能是内网地址。
+
+    字符串级的地址检查挡不住「先给一个公网 URL，让它 302 到回环/私网」。
+    宁可让对端返回 3xx 自己处理，也不要替它跳。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+#: 允许的 webhook scheme。file:// 能读本地文件，ftp:// 之类能触发别的协议栈，
+#: 都没有理由出现在「接收告警的 HTTP 地址」这个场景里。
+_ALLOWED_WEBHOOK_SCHEMES = ("http", "https")
+
+#: 单个 webhook URL 的长度上限（正常地址 < 1KB）。
+_MAX_WEBHOOK_URL_LEN = 2048
+
+
+def _assert_webhook_url(url):
+    """校验 webhook URL；不合法就抛 ValueError。
+
+    拦的是**明显不是「外部告警接收端」的地址**：
+
+    * scheme 必须是 http/https（`file://` 能读本地文件）；
+    * host 不能是回环 / 链路本地 / 私有段地址 —— 这些是网关**自己**或
+      **它的内网邻居**，让网关去请求它们等于把它变成内网探测器
+      （`127.0.0.1` 面板口、`169.254.169.254` 云元数据、`10.x` 内网服务）。
+
+    这不是「防住所有 SSRF」—— DNS 重绑定与「公网 IP 解析到内网」都超出静态
+    判定的能力。目的是**拦住手滑和明显恶意**的那一大类，而不是声称万无一失。
+    真正的强隔离需要出站代理或网络策略，那超出本模块的职责。
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        raise ValueError("webhook URL 为空")
+    if len(raw) > _MAX_WEBHOOK_URL_LEN:
+        raise ValueError("webhook URL 过长（上限 %d 字符）" % _MAX_WEBHOOK_URL_LEN)
+    parts = urllib.parse.urlsplit(raw)
+    if parts.scheme.lower() not in _ALLOWED_WEBHOOK_SCHEMES:
+        raise ValueError("webhook URL 只允许 http/https（收到 %r）" % parts.scheme)
+    if parts.username or parts.password:
+        # URL 里带 userinfo：既是凭据泄露（会进日志），也是绕过主机判定的写法
+        # （`http://127.0.0.1@evil.com/` 里真正的主机是 evil.com，
+        #  但 `http://evil.com@127.0.0.1/` 里真正的主机是 127.0.0.1）。
+        raise ValueError("webhook URL 不得携带 userinfo（user:pass@）")
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("webhook URL 缺少主机名")
+    if _is_internal_host(host):
+        raise ValueError("webhook URL 指向内网/回环地址（%s）—— "
+                         "网关不应代为访问自己的内网" % host)
+    return raw
+
+
+#: 额外要拦的网段。`ipaddress.is_private` **不含** CGNAT（100.64.0.0/10）
+#: 与部分保留段 —— 那些地址在运营商网络里是「内网」，指过去同样是探测内网。
+_EXTRA_BLOCKED_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),   # CGNAT（运营商内网）
+    ipaddress.ip_network("192.0.0.0/24"),    # IETF 协议分配
+    ipaddress.ip_network("198.18.0.0/15"),   # 基准测试
+)
+
+
+def _is_blocked_ip(ip):
+    """True when the address is one the gateway must not reach."""
+    if (ip.is_loopback or ip.is_link_local or ip.is_private
+            or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
+        return True
+    return any(ip in net for net in _EXTRA_BLOCKED_NETWORKS)
+
+
+def _is_internal_host(host):
+    """True when the host names the gateway itself or a private network.
+
+    **域名也要解析后判**：只做字符串检查的话，`evil.example` 解析到
+    `127.0.0.1` 就能通过 —— 那是同一件事换个写法。解析时**所有**地址都必须
+    合法（多值 DNS：只查第一个 A 记录会被绕过）。
+    """
+    if host in ("localhost", "localhost.localdomain", "ip6-localhost"):
+        return True
+    if host == "::1" or host == "0:0:0:0:0:0:0:1":
+        return True
+    # .local / .internal 之类是内网名字
+    if host.endswith((".local", ".internal", ".localdomain")):
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        return _is_blocked_ip(addr)
+    # 是个域名：解析后逐个判 —— 有一个指向内网就整体拒绝。
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        # 解析不了：不阻断（DNS 抖动不该让告警彻底不能用），但也不放行到
+        # 「已确认公网」的结论 —— 由投递时的连接失败自然报出来。
+        return False
+    for info in infos:
+        raw = str(info[4][0]).split("%")[0]
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            return True     # 解析出看不懂的地址 → 按不安全处理
+        if _is_blocked_ip(ip):
+            return True
+    return False
+
+
+def _safe_error_text(exc):
+    """把投递异常压成**不含响应体**的一行短文本。
+
+    urllib 的 HTTPError / URLError 在 `str(exc)` 里会带上**响��正文** ——
+    直接回显给面板就等于把内网服务的返回内容泄露出去（SSRF 读）。
+    这里只保留异常类型与状态码，正文一律丢弃。
+    """
+    status = getattr(exc, "code", None)
+    if status is not None:
+        return "HTTP %s" % status
+    reason = getattr(exc, "reason", None)
+    if reason:
+        return str(reason)[:120]
+    return type(exc).__name__
 
 
 def _deliver(cfg, event, payload):
@@ -194,13 +337,19 @@ def _deliver(cfg, event, payload):
         if sig:
             headers[SIGNATURE_HEADER] = sig
         try:
-            _post(hook["url"], body, headers)
-        except Exception as exc:
+            # 先校验 URL 再发 —— 面板用户可能填了内网地址（手滑或恶意）。
+            url = _assert_webhook_url(hook.get("url"))
+            _post(url, body, headers)
+        except ValueError as exc:
             errors.append("webhook: %s" % exc)
+        except Exception as exc:
+            # 错误文本里可能带响应体 —— 用安全版本，不回显正文。
+            errors.append("webhook: %s" % _safe_error_text(exc))
 
     sc = cfg.get("serverchan")
     if sc:
-        # ServerChan 走 GET，参数放在 query 里。
+        # ServerChan 走 GET，参数放在 query 里。key 会被 quote 成路径段，
+        # 所以 key 里塞 `../` 或 `@` 改不了 host。
         title = "WorkBuddy2API-Hub 告警: %s" % event
         text = json.dumps(payload, ensure_ascii=False)[:1800]
         params = urllib.parse.urlencode({"title": title, "desp": text})
@@ -209,7 +358,7 @@ def _deliver(cfg, event, payload):
         try:
             _post(url, b"", {"Content-Type": "text/plain"})
         except Exception as exc:
-            errors.append("serverchan: %s" % exc)
+            errors.append("serverchan: %s" % _safe_error_text(exc))
 
     return (not errors), ("; ".join(errors) if errors else "")
 

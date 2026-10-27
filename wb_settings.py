@@ -155,6 +155,36 @@ ACCOUNT_MAX_CONCURRENT_MAX = 10
 ALERTS_KEY = "alerts"
 
 
+#: 告警阈值允许的键（白名单）。回显时只给这三个 —— 别的键不进面板，
+#: 避免「往 thresholds 里塞什么就回显什么」。
+ALERT_THRESHOLD_KEYS = ("min_ready", "for_ticks", "clear_ticks")
+#: 各阈值的 (默认值, 下界, 上界)。上界不是装饰：for_ticks 太大 → 去抖永远攒不满
+#: → 告警永远不发；min_ready 太小 → 降级永远成立 → 告警永远发。
+ALERT_THRESHOLD_BOUNDS = {
+    "min_ready": (8, 1, 1000),
+    "for_ticks": (2, 1, 100),
+    "clear_ticks": (2, 1, 100),
+}
+
+
+def _alert_thresholds(raw):
+    """把阈值读成**白名单 + 有界**的 dict。"""
+    out = {}
+    source = raw if isinstance(raw, dict) else {}
+    for key in ALERT_THRESHOLD_KEYS:
+        fallback, low, high = ALERT_THRESHOLD_BOUNDS[key]
+        value = source.get(key)
+        if isinstance(value, bool) or value is None:
+            number = fallback
+        else:
+            try:
+                number = int(value)
+            except (TypeError, ValueError, OverflowError):
+                number = fallback
+        out[key] = max(low, min(high, number))
+    return out
+
+
 def alerts(accounts_dir):
     """读告警配置的**公开视图**（不含 secret / key）。
 
@@ -165,22 +195,49 @@ def alerts(accounts_dir):
         return {"webhook": False, "serverchan": False, "thresholds": {}}
     hook = raw.get("webhook")
     sc = raw.get("serverchan")
-    th = raw.get("thresholds")
     return {
         "webhook": bool(isinstance(hook, dict) and str(hook.get("url") or "").strip()),
         "serverchan": bool(isinstance(sc, dict) and str(sc.get("key") or "").strip()),
-        "thresholds": (dict(th) if isinstance(th, dict) else {}),
+        # 白名单回显：只给三个已知阈值键。
+        "thresholds": _alert_thresholds(raw.get("thresholds")),
     }
 
 
 def set_alerts(accounts_dir, value):
-    """写告警配置。空 dict = 全部关闭（清掉 webhook 与 ServerChan）。"""
+    """写告警配置。空 dict = 全部关闭（清掉 webhook 与 ServerChan）。
+
+    **校验在这里做**（纵深防御）：不只靠调用方校验 —— 任何调用方都拿不到
+    未校验的 dict 落盘。URL 的 scheme / 内网地址检查见 wb_alerts
+    （settings 不 import wb_alerts，避免循环依赖；由调用方负责 URL 校验，
+    这里负责**字段白名单与长度**）。
+    """
     if not isinstance(value, dict):
         raise ValueError("alerts must be an object")
+    cleaned = {}
+    hook = value.get("webhook")
+    if isinstance(hook, dict):
+        url = str(hook.get("url") or "").strip()
+        secret = str(hook.get("secret") or "").strip()
+        if url or secret:
+            if len(url) > 2048:
+                raise ValueError("webhook URL too long")
+            if len(secret) > 512:
+                raise ValueError("webhook secret too long")
+            cleaned["webhook"] = {"url": url, "secret": secret}
+    sc = value.get("serverchan")
+    if isinstance(sc, dict):
+        key = str(sc.get("key") or "").strip()
+        if key:
+            if len(key) > 128:
+                raise ValueError("serverchan key too long")
+            cleaned["serverchan"] = {"key": key}
+    thresholds = value.get("thresholds")
+    if isinstance(thresholds, dict):
+        cleaned["thresholds"] = _alert_thresholds(thresholds)
     with _lock:
         data = load(accounts_dir)
-        if value:
-            data[ALERTS_KEY] = value
+        if cleaned:
+            data[ALERTS_KEY] = cleaned
         else:
             data.pop(ALERTS_KEY, None)
         save(accounts_dir, data)

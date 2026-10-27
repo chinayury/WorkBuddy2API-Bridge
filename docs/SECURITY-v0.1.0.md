@@ -183,3 +183,121 @@ chmod 600 /opt/workbuddy2api-hub/.env
 | `wb_agents.integrate` 写入的具体文件路径集合 | 只确认 `client_id` 取自固定表，未逐个核对路径构造 |
 | 前端 XSS 全量审查 | 只做了危险 sink 的抽样（`innerHTML` / `insertAdjacentHTML` / `postMessage` / `javascript:`）；`esc()` 只转义 `& < > "`，**不转义单引号** —— 属性上下文若用单引号包裹需另行核对 |
 | 依赖 CVE | 无第三方依赖，无 CVE 面可查 |
+
+---
+
+## 九、v0.1.1 – v0.1.6 增量安全审查（2026-10-27）
+
+> 上一节及以前的所有结论基于 **v0.1.0（31 个模块）**。此后新增了
+> `wb_alerts.py` 等模块，**其中引入了一条「外部输入 → 内部网络」的通道**，
+> 必须单独审。本节是增量审查与修复记录。
+>
+> **审查对象**：`release/` @ v0.1.6（33 个模块）· **基线**：v0.1.0（`5cbcd34`）
+> **审查方式**：只读逐行审计 + urllib 行为本地实测 + 针对性单测
+
+### 9.1 变更面与供应链（结论：仍无第三方依赖）
+
+| 项 | v0.1.0 | v0.1.6 |
+|---|---|---|
+| `.py` 模块数 | 31 | **33** |
+| 第三方依赖 | 0 | **0**（AST 全量 import 扫描复核） |
+| `requirements.txt` / `pyproject.toml` / `Pipfile` / `poetry.lock` | 均不存在 | **均不存在** |
+| 新增对外 HTTP 路由 | — | **1 条**：`POST /alerts/test` |
+
+`wb_alerts.py` 只 import 标准库（hashlib / hmac / ipaddress / json / os / queue /
+socket / threading / time / urllib）+ 本地 `wb_settings`。**「没有可被投毒的依赖链」
+这个结论在 v0.1.6 依然成立。**
+
+### 9.2 本轮新引入的高危问题：SSRF（已修复）
+
+**问题**：v0.1.5 的告警通道让网关能向**面板用户填写的任意 URL** 发 HTTP 请求，
+而 `_post()` 对该 URL **零校验**：
+
+| 目标 | 修复前实测 |
+|---|---|
+| `file:///c:/Windows/win.ini` | **成功读到文件内容**（默认 opener 带 `FileHandler`） |
+| `http://127.0.0.1:8788/panel/status` | 真实发起连接 |
+| `http://169.254.169.254/latest/meta-data/` | 真实发起连接（云元数据端点） |
+| `http://10.x` / `192.168.x` / `172.16.x` | 真实发起连接（内网） |
+| 301/302/307 跳转 | 默认 opener **跟随** → 字符串级白名单可被绕过 |
+| `ftp://` / `data:` | 未被拦 |
+
+配合 `/alerts/test` 会把 `str(exc)` 回显给面板（内含响应体），
+构成完整的 **SSRF 读取链**；即使不回显响应体，也仍是「内网端口扫描 + 服务指纹」的
+**盲 SSRF 预言机**。
+
+**可达性**：需要面板会话。默认面板密码是 `admin`（v0.1.0 报告 S-12 已记；
+本部署已改为随机强密码）—— 所以生产上的实际风险由部署侧缓解，
+但**代码层不该留这条通道**。
+
+**修复**（v0.1.6）：
+
+| 措施 | 落点 |
+|---|---|
+| scheme 只允许 `http`/`https` | `wb_alerts._assert_webhook_url()` |
+| 长度上限 2048 | 同上 |
+| 禁止 userinfo（`user:pass@`） | 同上（既是凭据泄露，也是主机判定绕过写法） |
+| 拒绝回环 / 私有段 / 链路本地（含云元数据）/ CGNAT(100.64/10) / 保留段 | `_is_internal_host()` + `_is_blocked_ip()` |
+| **域名也要解析后判**（`evil.example` → 127.0.0.1） | `_is_internal_host()` 走 `getaddrinfo` |
+| **多值 DNS 全部地址都要合法** | 同上，逐个判而不是只看第一个 A 记录 |
+| **不跟随跳转**（公网 URL 302 到内网） | `_NoRedirectHandler` |
+| **不回显响应体** | `_post()` 只读 1 字节；`_safe_error_text()` 只留类型与状态码 |
+| **保存时也校验**（不让危险 URL 落盘） | `wb_proxy._handle_settings_save()` 的 alerts 分支 |
+| **阈值有上下界** | `wb_settings._alert_thresholds()` / `wb_proxy._clamp_alert_int()` |
+
+**残余风险（诚实声明）**：**DNS 重绑定**仍可能绕过「解析时检查」——
+攻击者让一个域名先解析到公网 IP 通过校验，连接时再解析到内网。
+彻底消除需要改成**主机白名单**，或「解析后按 IP 直连并校验 Host/SNI」。
+当前实现把「任意 URL 打内网」降级为「仅公网地址可打」，已消除本轮审计发现的
+全部可利用路径。
+
+### 9.3 其它本轮新引入并已修复的问题
+
+| # | 问题 | 后果 | 修复 |
+|---|---|---|---|
+| A | 阈值**只有下界没有上界** | `for_ticks=10**9` → 去抖永远攒不满 → **告警永远不发**，恰好抵消 v0.1.5 的全部价值 | `_alert_thresholds()` 加上下界 |
+| B | 阈值非数字 → `int()` 抛 `ValueError`/`OverflowError` | 异常一路冒到 socket handler（那里没有 try）→ **连接被重置 + stderr 抛 traceback**，而不是回 400 | `_clamp_alert_int()` 接住三种异常 |
+| C | alerts secret / webhook URL 未进日志打码名单 | 钉钉/飞书这类 webhook 常把 token 放在 URL 路径里，会长期留在日志/日志库 | `_register_pool_secrets()` 登记 secret、URL、ServerChan key |
+| D | `set_alerts()` 无 schema 校验（只靠调用方） | 纵深防御缺失 | 校验下沉到 `wb_settings.set_alerts()`：字段白名单 + 长度 + 阈值区间 |
+| E | `alerts()` 原样回显 `thresholds` | 往 thresholds 塞的键会被回显给面板 | 改白名单回显（只回三个已知键） |
+
+### 9.4 复核确认**没有**问题的项
+
+| 项 | 结论 |
+|---|---|
+| secret 外泄 | 公开视图、`/settings` 回读、`reply["alerts"]`、`account_views()`、导出路径 —— **逐条查过，均不含 secret** |
+| `/alerts/test` 越权 | 与 `/settings/save` 同门 `_panel_ok()`；仅 POST；token 只走 header；CORS 不开 → 无跨域、无表单 CSRF |
+| 导入投毒 `unverifiedSince` | `normalise_import_row()` 是**显式白名单**，不含该字段 → 构造账号 JSON 无法把它投毒成「永不派发」 |
+| `mark_verified()` 跨账号解标记 | 只改 `self`；调用点的 `account` 都是发起该请求的那个对象 |
+| `USAGE_DIR` 外部可控 | 只由环境变量决定，无 HTTP 写入口 → 只能由部署者/root 控制 |
+| 状态文件写侧符号链接 | tmp 名带 `uuid4` + `O_EXCL|O_CREAT` → 保证新建、不跟随已存在符号链接；`os.replace` 原子替换 |
+| 损坏状态文件 | 只置 `load_error`，**明确不发明暂停**（宁可少暂停，不可凭空停池）；下次写盘自愈 |
+| `empty_pool` 误报 503 | 真实上游故障报文不会以 `no usable account` 开头 → 不会把上游故障报成「缺账号」 |
+| 告警洪水 | 触发源受限；去抖 key 按账号；队列有界 200，满则丢并计数 → 无法无限放大 |
+
+### 9.5 本轮渗透测试记录（新增项）
+
+| # | 测试 | 结果 |
+|---|---|---|
+| T11 | webhook URL = `file:///etc/passwd` | **拒绝**（400，scheme 不允许）✅ |
+| T12 | webhook URL = `http://127.0.0.1:8788/panel/status` | **拒绝**（400，回环）✅ |
+| T13 | webhook URL = `http://169.254.169.254/latest/meta-data/` | **拒绝**（400，链路本地）✅ |
+| T14 | webhook URL = `http://10.0.0.1/` / `192.168.x` / `100.64.0.1` | **拒绝**（400，私网 / CGNAT）✅ |
+| T15 | webhook URL = `http://user:pass@example.com/` | **拒绝**（400，userinfo）✅ |
+| T16 | 域名解析到 127.0.0.1 | **拒绝**（400，解析后判定）✅ |
+| T17 | 投递失败时错误文本含响应体 | **不含**（只留异常类型/状态码）✅ |
+| T18 | `for_ticks=10**9`（告警静默化） | 被夹到 100 ✅ |
+| T19 | `min_ready="abc"` / `1e400` | 回落默认值，不抛异常、不 500 ✅ |
+| T20 | 公开视图 / 回读 / 导出含 secret | **均不含** ✅ |
+| T21 | 导入带 `unverifiedSince` 的账号 JSON | 该字段被白名单归一化丢弃 ✅ |
+| T22 | 告警 webhook 收到 302 跳到内网 | **不跟随**（拒绝跳转）✅ |
+
+（对应单测：`tests/_test_alerts_security.py`，27 项。）
+
+### 9.6 部署加固清单（v0.1.6 增补）
+
+- [ ] **若配了 webhook**：URL 必须是**公网可达**的地址；不要填 `127.0.0.1` /
+      `169.254.169.254` / `10.x` / `192.168.x`（代码会拒绝，但说明意图有问题）
+- [ ] 若 webhook URL 里带 token，确认 `accounts/settings.json` 权限是 `0600`
+- [ ] `usage/` 必须在**持久卷**里 —— 否则 v0.1.6 的连坐暂停跨重启不存活
+- [ ] 面板密码仍**不是**默认值（SSRF 的可达性完全取决于它）

@@ -10279,7 +10279,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "0.1.6",
+        "version": "0.1.7",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -10553,6 +10553,18 @@ def _register_pool_secrets():
         except Exception:
             pass
         register_secret(API_KEY or "")
+        # 告警通道的凭据也要打码（v0.1.6 补）：
+        # 钉钉 / 飞书这类 webhook 常把 token 直接放在 URL 路径里
+        # （`https://oapi.dingtalk.com/robot/send?access_token=xxx`），
+        # 而 URL 与 secret 都可能被写进日志或日志库 —— 不登记就会长期泄露。
+        try:
+            alerts_cfg = wb_alerts.config(ACCOUNTS_DIR)
+            hook = alerts_cfg.get("webhook") or {}
+            register_secret(hook.get("secret") or "")
+            register_secret(hook.get("url") or "")
+            register_secret((alerts_cfg.get("serverchan") or {}).get("key") or "")
+        except Exception:
+            pass
 
 
 def _redact_account_names(obj):
@@ -14102,6 +14114,30 @@ class RateLimited(Exception):
         # wording.
         self.message = message or ""
         super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
+
+
+def _clamp_alert_int(value, fallback, low, high):
+    """把告警阈值读成一个**有界**整数。
+
+    上界不是装饰：for_ticks/clear_ticks 太大 → 去抖永远攒不满 → 告警永远不发；
+    min_ready 太小（如 0）→ 降级永远成立 → 告警永远发。两种都是「配了等于没配」，
+    还会把面板的投递统计变成噪音。
+
+    `OverflowError` 也要接：`int(1e400)` 会抛它。不接的话这个异常会一路冒到
+    socket handler（那里没有 try），结果是**连接被重置 + stderr 抛 traceback**，
+    而不是回一个 400。
+    """
+    if isinstance(value, bool) or value is None:
+        return fallback
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    if number < low:
+        return low
+    if number > high:
+        return high
+    return number
 
 
 def _empty_pool_status(message):
@@ -18969,7 +19005,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/0.1.6"
+    server_version = "wb-proxy/0.1.7"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -20595,6 +20631,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not secret:
                     secret = (current.get("webhook") or {}).get("secret", "")
                 if url or secret:
+                    # **保存时就校验** URL：不让危险地址落盘（否则运维以为配好了，
+                    # 实际每次告警都失败，排查时更难找到原因）。校验规则见
+                    # wb_alerts._assert_webhook_url（只允许 http/https，禁回环与内网）。
+                    try:
+                        url = wb_alerts._assert_webhook_url(url) if url else ""
+                    except ValueError as exc:
+                        return self._error(400, "webhook URL 不合法: %s" % exc,
+                                           "invalid_request_error")
                     out["webhook"] = {"url": url, "secret": secret}
             sc = raw.get("serverchan")
             if isinstance(sc, dict):
@@ -20605,10 +20649,12 @@ class Handler(BaseHTTPRequestHandler):
                     out["serverchan"] = {"key": key}
             th = raw.get("thresholds")
             if isinstance(th, dict):
+                # 上界必须有：for_ticks/clear_ticks 设成极大值会让告警**永远不发**
+                #（去抖永远攒不满），min_ready 设成 0 会让降级**永远成立**。
                 out["thresholds"] = {
-                    "min_ready": max(1, int(th.get("min_ready") or 8)),
-                    "for_ticks": max(1, int(th.get("for_ticks") or 2)),
-                    "clear_ticks": max(1, int(th.get("clear_ticks") or 2)),
+                    "min_ready": _clamp_alert_int(th.get("min_ready"), 8, 1, 1000),
+                    "for_ticks": _clamp_alert_int(th.get("for_ticks"), 2, 1, 100),
+                    "clear_ticks": _clamp_alert_int(th.get("clear_ticks"), 2, 1, 100),
                 }
             wb_settings.set_alerts(ACCOUNTS_DIR, out)
             # 回读只给「配没配」，不给 secret 本身。

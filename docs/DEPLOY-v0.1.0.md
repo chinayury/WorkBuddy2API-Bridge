@@ -71,6 +71,41 @@ docker build -t workbuddy2api-hub:0.1.0 .
 > `release/Dockerfile` 用 `FROM ghcr.io/ardeyouxipianyi/workbuddy2api-hub@sha256:1d7d85fa…`
 > 按 digest 钉死基础镜像 —— 换成具体 digest 而不是 `:latest`，构建结果才可复现。
 
+#### 3.3.1 v0.1.3 起的推荐形态：**在部署服务器上构建 + 逐文件 sha 硬校验**
+
+补丁层现在是**全部 32+ 个应用模块**（不只是改过的那几个），所以「只 COPY 补丁文件」
+的做法已经过时 —— 那样镜像里的其余模块还是旧版，行为不可预期。
+
+推荐流程（**镜像在服务器上构建，不要在本地工作站构建**）：
+
+```sh
+# 1. 上传发布包（含 tests/）
+pscp workbuddy2api-hub-v0.1.6.tar.gz root@<host>:/tmp/
+
+# 2. 解包到发布树
+rm -rf /opt/workbuddy2api-hub/release && mkdir -p /opt/workbuddy2api-hub/release
+tar -xzf /tmp/workbuddy2api-hub-v0.1.6.tar.gz -C /opt/workbuddy2api-hub/release
+
+# 3. 在服务器上构建
+cd /opt/workbuddy2api-hub/release
+docker build -f Dockerfile.local -t workbuddy2api-hub:0.1.6 .
+
+# 4. 逐文件 sha 校验（不一致即中止部署）
+for f in $(ls wb_*.py dashboard.html); do
+  ctx=$(sha256sum "$f" | awk '{print $1}')
+  img=$(docker run --rm --entrypoint sha256sum workbuddy2api-hub:0.1.6 "/app/$f" | awk '{print $1}')
+  [ "$ctx" = "$img" ] || { echo "不一致: $f"; exit 1; }
+done
+
+# 5. 切 compose 的 image 行并重启
+```
+
+`Dockerfile.local` 是 `FROM <官方镜像 digest> + COPY wb_*.py dashboard.html ./`，
+**覆盖全部应用模块**（通配符自动包含新增模块，不需要改 Dockerfile）。
+
+> 为什么不建议在本地构建镜像：构建负载压在工作站上会拖垮它（实测曾导致整机重启、
+> 后台任务丢失）。本地只做源码编辑与推送，镜像在部署服务器上构建。
+
 ### 3.4 写 compose
 
 ```yaml
@@ -191,6 +226,10 @@ macOS/Linux：`./start-wb-proxy.sh` / `./start-wb-proxy-lan.sh`
 | `WB_LOCAL_WEB_TOOLS` | `0` | 由网关代跑客户端声明的 `web_search` / `web_fetch`（**默认关**） |
 | `WB_DESKTOP_CHAT_COMPAT` | `0` | 桌面 chat 请求头一致性实验开关（**默认关**，需重启） |
 | `WB_OPS_*` | — | 运维补丁层的开关（循环守卫、混合停滞、观测文件等），详见 `docs/PATCHES.md` |
+| `WB_RESTRICTION_HOLD_SECONDS` | `1800` | 上游风控连坐时**整池暂停**的秒数。**设为 0 即彻底关闭这个保护**（重启后依然生效） |
+| `WB_RESTRICTION_WAVE_MIN` | `2` | 多少个**不同**账号在窗口内被 11140 限制才算触发整池暂停 |
+| `WB_RESTRICTION_WAVE_WINDOW` | `900` | 上面的判定窗口（秒） |
+| `WB_RESTRICTED_403_ROTATE_MAX` | `0` | 账号被 11140 后，同一条请求最多再换几个号重试。**默认 0 = 不换**（社区复盘的红线：解封前严禁换号继续打同一台设备） |
 
 > **所有整型/浮点型环境变量都做了容错**：值写错（如 `16m`）会回退默认值并继续启动，
 > 不会让整个网关在 import 阶段崩掉（v0.1.0 起）。
@@ -202,12 +241,48 @@ macOS/Linux：`./start-wb-proxy.sh` / `./start-wb-proxy-lan.sh`
 | 路径 | 内容 | 备份必要性 |
 |---|---|---|
 | `accounts/` | 凭据 JSON、`settings.json`（面板密码哈希、API Key、各类设置）、`accounts/` 下的客户端凭据 | **必须** |
-| `usage/` | 用量日志 `usage.jsonl`、活动历史 `activity_history.jsonl`、SQLite 日志库（可选）、模型目录缓存 | 建议 |
+| `usage/` | 用量日志 `usage.jsonl`、活动历史 `activity_history.jsonl`、SQLite 日志库（可选）、模型目录缓存、**连坐状态 `restriction-state.json`（v0.1.6 起）** | 建议 |
 
 ```sh
 chmod 700 accounts usage
 chmod 600 accounts/*.json .env
 ```
+
+### 5.1 v0.1.6 新增：`usage/restriction-state.json`
+
+上游风控连坐（整池暂停 30 分钟）的状态文件。**它必须落在持久卷里** ——
+`usage/` 若不是持久目录，容器重启后暂停就丢了，池子会立刻恢复派发，
+冷账号重新上桌可能触发**第二轮**连坐。
+
+| 项 | 值 |
+|---|---|
+| 内容 | 只有元数据：账号哈希（`sha256(uid)`，**不是**原始 uid）、事件时刻、原始到期时刻。**不含任何令牌** |
+| 权限 | 0600（`O_EXCL` 创建） |
+| 写入 | tmp（`path.tmp-<uuid4>`）+ `fsync` + `os.replace` |
+| 上限 | 1 MiB / 每区域 4096 条事件 |
+
+**回滚到旧版时**：旧代码不认识这个文件，会静默忽略 —— 留着无害；要彻底清掉就删它。
+删掉意味着**放弃当前尚未到期的暂停**，重启后池子会恢复派发。
+
+### 5.2 v0.1.5 新增：告警配置（在 `accounts/settings.json` 里）
+
+```json
+{
+  "alerts": {
+    "webhook": {"url": "https://example.com/hook", "secret": "..."},
+    "serverchan": {"key": "SCT..."},
+    "thresholds": {"min_ready": 8, "for_ticks": 2, "clear_ticks": 2}
+  }
+}
+```
+
+`secret` 与 ServerChan key **只写不读**：面板回读只有「配没配」两个布尔值，
+输入框留空即「保持原值」。`settings.json` 权限 0600（与 API Key 同一把锁）。
+
+**不配就完全不发请求** —— 默认关闭，`wb_alerts` 一个网络请求都不发。
+
+> ⚠️ **webhook URL 会让网关主动向该地址发 HTTP 请求**。请只填你自己控制的地址：
+> 填成 `http://127.0.0.1:<内网端口>/` 或云元数据地址等于让网关替你去访问内网。
 
 ---
 
@@ -315,12 +390,16 @@ python deploy/test_task_patch.py _src/workbuddy2api-hub-main   # 控制组：必
 | 任务一直「进行中」 | 该任务是 `unforgeable`（需真人操作，如关注公众号满 24h） | v0.1.0 起这类行显示「需人工」并写明原因 |
 | 面板显示的版本是 `1.7.33` | 跑的还是旧镜像 | v0.1.0 应显示 `0.1.0`；`docker compose up -d --no-build --pull never` 切到新镜像 |
 | 容器起来但端口不通 | 反代覆盖了 `X-Real-IP` 或未监听 `0.0.0.0` | `--lan` 会自动切到 `0.0.0.0`；检查 `docker port wb-proxy` |
+| **客户端一直拿 429，重启后又好了** | 上游风控连坐：整池暂停 30 分钟 | v0.1.6 起暂停**落盘**（`usage/restriction-state.json`），重启不丢。查 `/health` 的 `restriction_pause.remaining_seconds` |
+| **面板上某个号标着「未验证」，不参与派发** | 该凭据从未被上游接受过（`credits.used == 0`） | 点该号的「测试」验证一次：通过（上游回 14003）即自动放行；被上游判非法（403/11140）则需先去官方渠道解封 |
+| **冷账号被重新启用后整池连坐** | v0.1.4 之前没有入池闸门，启用即派发 | v0.1.4 起未验证账号不参与派发；v0.1.6 起暂停跨重启存活。详见 `CHANGELOG-v0.1.4.md` / `CHANGELOG-v0.1.6.md` |
+| **告警收不到** | 没配通道 / 阈值没到 / 去抖没满 | 面板「设置 → 账号池告警」看「已开启」状态与投递统计；点「发送测试通知」自测 |
 
 ---
 
 ## 十一、OpenWrt
 
-`wrt/openwrt/workbuddy2api/` 下有 OpenWrt 包定义（`PKG_VERSION` 已同步为 `0.1.0`）。
+`wrt/openwrt/workbuddy2api/` 下有 OpenWrt 包定义（`PKG_VERSION` 已同步为 `0.1.6`）。
 
 ---
 
@@ -332,4 +411,5 @@ python deploy/test_task_patch.py _src/workbuddy2api-hub-main   # 控制组：必
 | [USAGE-v0.1.0.md](USAGE-v0.1.0.md) | 面板与 API 的功能使用说明 |
 | [BUGFIXES-v0.1.0.md](BUGFIXES-v0.1.0.md) | 全部 BUG 的症状/触发条件/根因/改法，以及审计发现但未修的排队清单 |
 | [CHANGELOG-v0.1.0.md](CHANGELOG-v0.1.0.md) | 功能优化与新增日志、兼容性变化、版本路线图 |
+| [CHANGELOG-v0.1.1.md](CHANGELOG-v0.1.1.md) … [CHANGELOG-v0.1.6.md](CHANGELOG-v0.1.6.md) | 各增量版本的变更记录（流式工具调用修复 / 上游合并 / 未验证护栏 / 告警通道 / 暂停持久化） |
 | [SECURITY-v0.1.0.md](SECURITY-v0.1.0.md) | 安全审查报告：供应链、已修复安全问题、残余风险、渗透测试记录、加固清单 |

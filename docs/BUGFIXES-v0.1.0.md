@@ -189,6 +189,28 @@ HTTP 请求**，Windows 上连接偶尔被网络栈截断（`WinError 10054`）�
 **验证**：新增 `tests/_test_restriction_persistence.py`（17 项）与
 `tests/_test_empty_pool_status.py`（8 项）；回归 **231 passed / 0 failed / 0 skipped**。
 
+### 2.9 告警通道安全加固（v0.1.7）
+
+v0.1.5 新增的告警通道是本项目第一条「**外部输入 → 内部网络**」的通道
+（网关会向面板用户填的 URL 真的发 HTTP 请求）。本版做了增量安全审计并加固。
+
+| # | 严重度 | 症状 | 触发条件 | 根因 | 修复 |
+|---|---|---|---|---|---|
+| P26 | **高** | **SSRF**：面板用户填的 webhook URL 可指向 `file://`（读本地文件）、回环、私网、云元数据；配合 `/alerts/test` 回显异常文本构成完整读取链 | 已授权面板用户点「发送测试通知」 | `_post()` 对 URL **零校验**；默认 opener 带 `FileHandler` 且**跟随跳转** | `_assert_webhook_url()`：只允许 http/https、限长、禁 userinfo、拒绝回环/私有段/链路本地/CGNAT/保留段；**域名解析后判**（多值 DNS 全查）；`_NoRedirectHandler` 不跟随跳转；**不回显响应体**（`_safe_error_text()` 只留类型与状态码）；**保存时也校验** |
+| P27 | 中 | **告警静默化**：`for_ticks=10**9` → 去抖永远攒不满 → 告警**永远不发** | 面板里把阈值设成极大值 | 阈值**只有下界没有上界** | `wb_settings._alert_thresholds()` 加上下界（min_ready 1–1000，ticks 1–100） |
+| P28 | 中 | **异常导致连接被重置 + stderr 抛 traceback**（而不是 400） | 阈值填非数字（`"abc"`）或 `1e400` | `int()` 的 `ValueError`/`OverflowError` 未接住，一路冒到没有 try 的 socket handler | `_clamp_alert_int()` 接住三种异常并回落默认值 |
+| P29 | 低 | 带 token 的 webhook URL 长期留在日志/日志库 | 钉钉/飞书式 URL 里带 access_token | alerts secret / URL 没进日志打码名单 | `_register_pool_secrets()` 登记 secret、URL、ServerChan key |
+| P30 | 低 | 往 `thresholds` 里塞的键会被回显给面板；未校验的 dict 可落盘 | 直接调 `/settings/save` | `set_alerts()` 无 schema 校验、`alerts()` 原样回显 | 校验下沉到 `wb_settings.set_alerts()`（字段白名单 + 长度 + 阈值区间）；回显改白名单 |
+
+**残余风险（诚实声明）**：**DNS 重绑定**仍可能绕过「解析时检查」
+（先解析到公网 IP 通过校验，连接时再解析到内网）。彻底消除需要改成主机白名单，
+或「解析后按 IP 直连并校验 Host/SNI」。当前实现把「任意 URL 打内网」降级为
+「仅公网地址可打」，已消除本轮审计发现的全部可利用路径。
+
+**验证**：新增 `tests/_test_alerts_security.py`（27 项）；回归
+**232 passed / 0 failed / 0 skipped**。完整审计记录见
+`SECURITY-v0.1.0.md` 第九节（含 12 项新增渗透测试记录）。
+
 ---
 
 ## 三、已回退（审计提出但经回归证明是上游刻意设计）
