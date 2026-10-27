@@ -161,6 +161,34 @@
 
 **回滚点**：`/opt/workbuddy2api-hub/backups/accounts-before-pool-restore-20261027-001814.tar.gz`。
 
+### 2.8 连坐暂停跨重启存活 + 两个真 bug（v0.1.6）
+
+本节的四条来自对**上游 `ardeyouxipianyi/workbuddy2api-hub`** 与**第三方运维补丁线
+`wushuai0802/workbuddy2api-hub-ops-patch`**（新版本 `v1.8.0-ops.20261026.1`）的复核。
+完整分析见 `research/可借鉴要点清单.md` 第十节。
+
+| # | 严重度 | 症状 | 触发条件 | 根因 | 修复 |
+|---|---|---|---|---|---|
+| P22 | **高** | **连坐暂停在容器重启后消失** → 冷账号重新上桌 → 触发**第二轮**整池连坐 | 连坐期间重启容器（升级 / 崩溃 / OOM kill） | 区域暂停（`_RESTRICTION_HOLD`）**只在内存里**。「上游刚把这一区域的账号判非法」这个事实在重启后消失，池子立刻恢复派发 | 暂停落盘到 `usage/restriction-state.json`（原子写 + 0600 + 账号哈希 + 有界 + 坏文件不发明暂停），重启后恢复**原始到期时刻**。落地前提已核实：243 的 `usage/` 是持久卷 |
+| P23 | 中 | **Anthropic 协议空池返回 502**（Chat/Responses 返回 503） | 池子里没有可用账号时用 Claude Code / Anthropic SDK 调网关 | 该路径判空池用 `"no account" in low`，而真实抛出的消息是 `"no usable account for realm ..."` —— 子串 `"no account"` 不出现在 `"no usable account"` 里（中间隔着 `"usable "`） | 抽成共享的 `_empty_pool_status()`，三条协议共用；**账本记的码与响应的码也统一**（原来账本记 502、响应给 503） |
+| P24 | **高** | **上游的配额类 code 被误判为账号级风控** → 冷却一个健康账号 + 触发整池 30 分钟暂停 | 上游返回 `{"code":111400,...}` 这类相似 code | `11140` 的 code 匹配**没有右边界** | 正则收紧为 `11140(?=["\s,}]|$)`；措辞标记另外要求 403 语境（429/6004 的正文里也有「已被限制调用频率」） |
+| P25 | 中 | **网页活跃主动探出 403 11140** —— 事故链上的「帮凶」 | 未验证账号被 daily-chat 选中 | v0.1.4 的护栏只挡**模型请求**路径；网页活跃是独立链路，`wb_accounts.py` 的 HTTPError 分支只把 11140 变成一个错误字符串（不冷却、不隔离、不计连坐） | `wb_scheduler.py` 选 daily-chat 目标时加 `is_unverified()` 闸门，未验证账号直接跳过 |
+
+**为什么 P22 不是「加固」而是「修复同一条链的第二段」**：
+2026-10-26 晚生产上的连坐在容器内 **15:33~15:35 连续触发 7 次**，涉及
+`f7102b2e`（即 10-27 凌晨被拆掉的那颗炸弹）；**同一晚我们部署 v0.1.4 重启了容器**。
+那 7 次里只要有任何一次跨过重启点，事故就会重演。
+
+**顺带修掉的既有 flaky test**：
+`_test_daily_chat_web_retry_backoff.py::test_upstream_500_is_a_create_phase_failure`
+本身偶发失败（5 次跑里红 1 次）—— 它断言错误正文含 `'14220'`，但该用例会**真的发
+HTTP 请求**，Windows 上连接偶尔被网络栈截断（`WinError 10054`），正文里就没有
+14220 了。失败仍在 `create` 阶段，而用例要验的正是这个分类 ⇒ 改为断言
+`phase` / `attempts` / `error` 非空，**不再断言错误文本内容**。
+
+**验证**：新增 `tests/_test_restriction_persistence.py`（17 项）与
+`tests/_test_empty_pool_status.py`（8 项）；回归 **231 passed / 0 failed / 0 skipped**。
+
 ---
 
 ## 三、已回退（审计提出但经回归证明是上游刻意设计）

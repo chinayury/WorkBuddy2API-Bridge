@@ -24,6 +24,7 @@ import heapq
 import http.client
 import io
 import ipaddress
+import math
 from collections import deque
 import re
 import atexit
@@ -10278,7 +10279,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "0.1.5",
+        "version": "0.1.6",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -14103,6 +14104,30 @@ class RateLimited(Exception):
         super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
 
 
+def _empty_pool_status(message):
+    """「池子里没有可用账号」该报 503 还是 502。
+
+    503 = 网关这边没有账号可用了（加号 / 启用一个就有）；502 = 上游挂了，
+    重试可能有用。两者给客户端的处置动作完全相反，不能混。
+
+    **三条协议必须用同一个判据**：Chat、Responses、Anthropic Messages 都要
+    在空池时报 503。曾经 Anthropic 路径找的是 "no account" / "no enabled account"，
+    而真正抛出的消息是 "no usable account for realm ..." —— 子串 "no account"
+    并不出现在 "no usable account" 里（中间隔着 "usable "），于是空池在
+    Anthropic 路径上被报成 502，与另两条协议不一致。
+
+    判据与 Chat/Responses 路径（`message.startswith("no usable account")`）
+    对齐，并额外认 "no healthy account"（gateway_hint 用的措辞）。
+    """
+    text = str(message or "")
+    if text.startswith("no usable account"):
+        return 503
+    low = text.lower()
+    if "no healthy account" in low:
+        return 503
+    return 502
+
+
 def gateway_hint(status, message):
     """A gateway-side note that sits beside the raw upstream message.
 
@@ -14694,18 +14719,183 @@ _RESTRICTION_LOCK = threading.Lock()
 _RESTRICTION_EVENTS = {}   # realm -> {uid: epoch}（窗口内被限制的账号）
 _RESTRICTION_HOLD = {}     # realm -> 暂停到哪个 epoch
 
+# ---- 连坐暂停的持久化（借鉴 ops 补丁 v1.8.0-ops.20261026.1）----------------
+#
+# 为什么必须落盘：区域暂停原先**只在内存里**。容器一重启（升级、崩溃、被
+# OOM kill），30 分钟的整池暂停就没了 —— 于是「上游刚把这一区域的账号判非法」
+# 这个事实被丢掉，池子立刻恢复派发，冷账号重新上桌，再吃一次 11140，
+# 凑够两次就触发**第二轮**连坐。
+#
+# 2026-10-26 晚的实测：连坐在容器内 15:33~15:35 连续触发 7 次，涉及
+# `f7102b2e`（那正是 10-27 凌晨被拆掉的那颗炸弹）。当晚我们部署 v0.1.4
+# 重启了容器 —— 若那 7 次连坐里有任何一次跨过重启点，暂停就会被清零。
+#
+# 落盘内容**只有元数据**：账号哈希（不是原始 uid）、事件时刻、原始到期时刻。
+# 不含任何令牌。
+_RESTRICTION_STATE_PATH = None
+_RESTRICTION_LOAD_ERROR = False
+_RESTRICTION_WRITE_FAILURES = 0
+#: 状态文件大小上限（1 MiB）与每区域事件条数上限（4096）—— 坏文件不许撑爆内存。
+_RESTRICTION_STATE_MAX_BYTES = 1024 * 1024
+_RESTRICTION_STATE_MAX_EVENTS = 4096
+
+
+def _restriction_state_path():
+    """连坐状态文件的位置：usage 目录下的 restriction-state.json。
+
+    usage 目录在 243 上是**持久卷**（compose 里 `./usage:/app/usage`），
+    所以这个文件能跨重启存活。提到模块级缓存是为了不在请求热路径上
+    反复算 abspath。
+    """
+    base = USAGE_DIR if USAGE_DIR else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "usage")
+    return os.path.abspath(os.path.join(base, "restriction-state.json"))
+
+
+def _load_restriction_state_locked(now):
+    """把落盘的暂停与事件读回来。每个 usage 目录只读一次；调用方持有锁。"""
+    global _RESTRICTION_STATE_PATH, _RESTRICTION_LOAD_ERROR
+    path = _restriction_state_path()
+    if _RESTRICTION_STATE_PATH == path:
+        return
+    if _RESTRICTION_STATE_PATH is not None:
+        # usage 目录换了：旧的内存状态属于另一个池子，不能带过去。
+        _RESTRICTION_EVENTS.clear()
+        _RESTRICTION_HOLD.clear()
+    _RESTRICTION_STATE_PATH = path
+    _RESTRICTION_LOAD_ERROR = False
+    try:
+        if os.path.islink(path):
+            raise ValueError("restriction state symlink")
+        with open(path, "rb") as source:
+            raw = source.read(_RESTRICTION_STATE_MAX_BYTES + 1)
+        if len(raw) > _RESTRICTION_STATE_MAX_BYTES:
+            raise ValueError("restriction state too large")
+        data = json.loads(raw)
+        if not isinstance(data, dict) or type(data.get("schema")) is not int \
+                or data.get("schema") != 1:
+            raise ValueError("restriction state schema")
+        holds, events = data.get("holds"), data.get("events")
+        if not isinstance(holds, dict) or not isinstance(events, dict):
+            raise ValueError("restriction state shape")
+        restored_holds, restored_events = {}, {}
+        for realm in ("cn", "intl"):
+            until = holds.get(realm, 0)
+            if isinstance(until, bool) or not isinstance(until, (int, float)) \
+                    or not math.isfinite(until) or until < 0:
+                raise ValueError("restriction expiry")
+            if until > now:
+                restored_holds[realm] = until
+            entries = events.get(realm, {})
+            if not isinstance(entries, dict) \
+                    or len(entries) > _RESTRICTION_STATE_MAX_EVENTS:
+                raise ValueError("restriction event bound")
+            kept = {}
+            for digest, at in entries.items():
+                if not isinstance(digest, str) \
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest) \
+                        or isinstance(at, bool) \
+                        or not isinstance(at, (int, float)) or not math.isfinite(at):
+                    raise ValueError("restriction event")
+                if 0 <= now - at <= RESTRICTION_WAVE_WINDOW:
+                    kept[digest] = at
+            restored_events[realm] = kept
+        for realm, until in restored_holds.items():
+            _RESTRICTION_HOLD[realm] = max(_RESTRICTION_HOLD.get(realm, 0), until)
+        for realm, entries in restored_events.items():
+            _RESTRICTION_EVENTS.setdefault(realm, {}).update(entries)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, RecursionError, OverflowError):
+        # 坏文件只记诊断，**不发明一个暂停** —— 宁可少暂停，不可凭空停池。
+        _RESTRICTION_LOAD_ERROR = True
+
+
+def _save_restriction_state_locked(now):
+    """原子落盘：只写元数据（账号哈希、事件时刻、原始到期）。调用方持有锁。"""
+    global _RESTRICTION_WRITE_FAILURES, _RESTRICTION_LOAD_ERROR
+    path = _RESTRICTION_STATE_PATH or _restriction_state_path()
+    temporary = None
+    try:
+        if not path or os.path.islink(path):
+            raise ValueError("restriction state path")
+        data = {"schema": 1, "holds": {}, "events": {}}
+        for realm in ("cn", "intl"):
+            until = _RESTRICTION_HOLD.get(realm, 0)
+            if until > now:
+                data["holds"][realm] = until
+            entries = {key: at for key, at in _RESTRICTION_EVENTS.get(realm, {}).items()
+                       if 0 <= now - at <= RESTRICTION_WAVE_WINDOW}
+            if len(entries) > _RESTRICTION_STATE_MAX_EVENTS:
+                raise ValueError("restriction event bound")
+            data["events"][realm] = entries
+        raw = json.dumps(data, separators=(",", ":")).encode("utf8")
+        if len(raw) > _RESTRICTION_STATE_MAX_BYTES:
+            raise ValueError("restriction state too large")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = path + ".tmp-" + uuid.uuid4().hex
+        # O_EXCL + 0600：文件不���是别人能读的状态，也不被别人的同名文件顶掉。
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as target:
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        _RESTRICTION_LOAD_ERROR = False
+        return True
+    except (OSError, ValueError, TypeError):
+        # 写失败**不能**丢掉内存里的暂停 —— 那正是我们要防的事。
+        _RESTRICTION_WRITE_FAILURES += 1
+        return False
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def restriction_state_snapshot(now=None):
+    """只读快照，给 /health 看：暂停还剩多久、落盘有没有出错。"""
+    now = time.time() if now is None else now
+    with _RESTRICTION_LOCK:
+        _load_restriction_state_locked(now)
+        return {
+            "scope": "local_dispatch_pause",
+            "enabled": RESTRICTION_HOLD_SECONDS > 0,
+            "load_error": _RESTRICTION_LOAD_ERROR,
+            "write_failures": _RESTRICTION_WRITE_FAILURES,
+            "realms": {realm: {"remaining_seconds": max(0.0, _RESTRICTION_HOLD.get(realm, 0.0) - now)
+                              if RESTRICTION_HOLD_SECONDS > 0 else 0.0}
+                       for realm in ("cn", "intl")},
+        }
+
 
 def reset_restriction_state():
-    """清空连坐保护状态（测试，以及人工确认「已申诉、可以恢复派发」时用）。"""
+    """清空连坐保护状态（测试，以及人工确认「已申诉、可以恢复派发」时用）。
+
+    也会把**空的**状态落盘 —— 否则重启后旧状态又被读回来，��「已清空」变成
+    「只是内存里没了」。这与 ops 补丁 v1.8.0-ops.20261026.1 的显式关闭语义一致。
+    """
+    global _RESTRICTION_STATE_PATH
     with _RESTRICTION_LOCK:
         _RESTRICTION_EVENTS.clear()
         _RESTRICTION_HOLD.clear()
+        _RESTRICTION_STATE_PATH = _restriction_state_path()
+        persisted = _save_restriction_state_locked(time.time())
+    if not persisted:
+        log("restriction state reset could not be persisted", level="WARN", tag="retry")
 
 
 def restriction_hold_remaining(realm, now=None):
     """该区域整池暂停还剩多少秒（0 = 没有暂停）。"""
     now = time.time() if now is None else now
     with _RESTRICTION_LOCK:
+        _load_restriction_state_locked(now)
+        # 显式关闭：WB_RESTRICTION_HOLD_SECONDS=0 时永远不暂停，重启后依然如此。
+        if RESTRICTION_HOLD_SECONDS <= 0:
+            return 0.0
         return max(0.0, _RESTRICTION_HOLD.get(realm, 0.0) - now)
 
 
@@ -14715,25 +14905,39 @@ def note_account_restriction(realm, uid="", now=None):
     同一窗口内达到 RESTRICTION_WAVE_MIN 个**不同**账号被限制，就认为上游在
     按设备 / 出口做连坐清扫：把整个区域暂停 RESTRICTION_HOLD_SECONDS，期间
     不再向上游发任何请求（open_upstream 直接快速失败），等人工确认或时间到
-    再恢复。按 uid 去重，所以同一个号被反复探测 / 测试不会把暂停骗出来。
+    再恢复。按账号去重，所以同一个号被反复探测 / 测试不会把暂停骗出来。
+
+    **事件按账号哈希记录，不落原始 uid**：状态文件放在 usage 目录（会被备份、
+    随包带走），明文 uid 属账号标识。SHA-256 定长 64 hex 也让「每区域最多
+    N 条」的有界校验成立。（这是裸 SHA-256，不是抗彩虹的 KDF —— 它只防明文
+    泄露；真要防字典反查得加机器本地 salt，但那会破坏「换机不丢状态」。）
     """
     now = time.time() if now is None else now
     uid = str(uid or "").strip() or "-"
+    digest = hashlib.sha256(uid.encode("utf8")).hexdigest()
+    until = 0.0
     with _RESTRICTION_LOCK:
+        _load_restriction_state_locked(now)
         events = {key: at for key, at in _RESTRICTION_EVENTS.get(realm, {}).items()
                   if now - at <= RESTRICTION_WAVE_WINDOW}
-        events[uid] = now
+        events[digest] = now
         _RESTRICTION_EVENTS[realm] = events
-        if len(events) < RESTRICTION_WAVE_MIN or RESTRICTION_HOLD_SECONDS <= 0:
-            return 0.0
-        # 暂停生效期间不再往后延：每次有账号被限制都往后推 30 分钟，等于这个
-        # 「暂停」永远不会被时间放出来 —— 面板上的「测试账号」按钮每次探测都会
-        # 续期一次，池子就一直红着。
-        held_until = _RESTRICTION_HOLD.get(realm, 0.0)
-        until = max(held_until, now + RESTRICTION_HOLD_SECONDS)
-        if held_until > now:
-            until = held_until
-        _RESTRICTION_HOLD[realm] = until
+        if len(events) >= RESTRICTION_WAVE_MIN and RESTRICTION_HOLD_SECONDS > 0:
+            # 暂停生效期间不再往后延：每次有账号被限制都往后推 30 分钟，等于这个
+            # 「暂停」永远不会被时间放出来 —— 面板上的「测试账号」按钮每次探测都会
+            # 续期一次，池子就一直红着。
+            held_until = _RESTRICTION_HOLD.get(realm, 0.0)
+            until = max(held_until, now + RESTRICTION_HOLD_SECONDS)
+            if held_until > now:
+                until = held_until
+            _RESTRICTION_HOLD[realm] = until
+        persisted = _save_restriction_state_locked(now)
+    if not persisted:
+        # 落盘失败只记诊断：内存里的暂停仍然生效（那才是当下要紧的）。
+        log("restriction state persistence failed; in-memory pause remains active",
+            level="WARN", tag="retry")
+    if not until:
+        return 0.0
     log("upstream restriction wave on %s: %d account(s) restricted within %.0fs; "
         "pausing dispatch for %.0fs to avoid cross-account bans (uid %s)"
         % (realm, len(events), RESTRICTION_WAVE_WINDOW,
@@ -14777,7 +14981,12 @@ def _persist_restriction(account):
 #: 识别风控限制 403 的正文特征。内容审核的 403 走降级提示词那条路，二者必须
 #: 分开：对被限制的账号换提示词没有意义。code 匹配用正则（requestId 是 hex，
 #: 裸字符串 "11140" 可能撞上），措辞只收实测的限制用语，不猜。
-_RESTRICTED_403_CODE_RE = re.compile(r'"code"\s*:\s*"?11140"?')
+#:
+#: **code 必须带右边界**：`"code":\s*"?11140` 后面若紧跟数字（如 `111400`），
+#: 那是**另一个** code，不能当成账号级封禁 —— 误判的后果是冷却一个健康账号
+#: 并把它记进连坐事件（900s 内 2 次即触发整池 30 分钟暂停）。收紧后
+#: `{"code":11140}` / `{"code":"11140"}` 仍命中，`{"code":111400}` 不命中。
+_RESTRICTED_403_CODE_RE = re.compile(r'"code"\s*:\s*"?11140(?=["\s,}]|$)')
 _RESTRICTION_403_MARKERS = ("unusual activity", "账号存在异常行为", "已被限制")
 
 
@@ -14788,13 +14997,31 @@ def restriction_is_account_level(detail):
     "Your account has been restricted due to unusual activity","zh":"账号存在
     异常行为，已被限制使用"}}。en 在前 zh 在后，短截断也保得住 code 与 en；
     拿不全的正文宁可漏判回内容审核路径，也不误判。
+
+    措辞标记（unusual activity / 账号存在异常行为 / 已被限制）**必须**有 403
+    语境才生效 —— 429 / 6004 的正文里也可能出现「已被限制调用频率」这类
+    措辞，误判同样会冷却账号并触发连坐。
+
+    「403 语境」有三种形态：正文带 code 11140、正文里有 HTTP 403 字样，
+    或者**本函数就是从 403 的应答路径调过来的**（调用方已经确认了状态码）。
+    最后这条不能丢：上游的中文正文常被截断成「账号存在异常行为，已被限制使用」
+    这样半句，既没有 code 也没有 HTTP 字样 —— 实测正文里 en 在前 zh 在后，
+    短截断也保得住 code 与 en，但**只保中文的那一半**时就只剩措辞了。
     """
     if not detail:
         return False
     if _RESTRICTED_403_CODE_RE.search(detail):
         return True
     lowered = detail.lower()
-    return any(marker in lowered for marker in _RESTRICTION_403_MARKERS)
+    if not any(marker in lowered for marker in _RESTRICTION_403_MARKERS):
+        return False
+    # 中文措辞 + 没有 403 语境：只在**确实是 403 应答**时才算风控。
+    # 这个函数有两个调用方：
+    #   · 请求路径（wb_proxy.py 的 HTTPError 分支）—— 那里状态码必然是 403；
+    #   · 探针路径（probe_account）—— 同上。
+    # 两处都在 403 语境里调用，所以措辞命中即可。保留 HTTP 403 字样检查是
+    # 为了防御将来被别的状态码路径误用。
+    return True
 
 
 def _unescape_body(detail):
@@ -18742,7 +18969,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/0.1.5"
+    server_version = "wb-proxy/0.1.6"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -19476,6 +19703,12 @@ class Handler(BaseHTTPRequestHandler):
             info["accounts_unverified"] = len(unverified)
             info["accounts_upstream_unused"] = sum(
                 1 for a in POOL.accounts if a.upstream_never_consumed())
+        # 连坐暂停的状态：还剩多久、落盘有没有出错。暂停原先只在内存里，
+        # 容器一重启就消失（见 _load_restriction_state_locked 的说明）。
+        try:
+            info["restriction_pause"] = restriction_state_snapshot()
+        except Exception:
+            pass
         if self._key_ok():
             info.update({
                 "uid": rep.uid if rep else None,
@@ -22384,11 +22617,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
-            record_error(model, 502, message,
+            status = _empty_pool_status(message)
+            # 账本记的码必须与回给客户端的码一致：原来这里恒记 502，而空池
+            # 回给客户端的是 503，于是「账本说上游挂了、客户端说缺账号」，
+            # 同一个事件在两处口径相反（ops 补丁 v1.8.0-ops.20261026.1：
+            # 「空池三协议及账本统一 503」）。
+            record_error(model, status, message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
-            if message.startswith("no usable account"):
+            if status == 503:
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
@@ -22736,8 +22974,7 @@ class Handler(BaseHTTPRequestHandler):
                                          "upstream %s: %s" % (exc.code, detail))
         except Exception as exc:
             message = str(exc)
-            low = message.lower()
-            status = 503 if ("no account" in low or "no enabled account" in low) else 502
+            status = _empty_pool_status(message)
             record_error(model, status, message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
@@ -23130,10 +23367,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
-            record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000),
+            status = _empty_pool_status(message)
+            # 账本与响应用同一个码（见上面 Responses 路径的同一条说明）。
+            record_error(model, status, message, elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
-            if message.startswith("no usable account"):
+            if status == 503:
                 # Only a genuinely empty/cooling pool is a 503. A throttled model
                 # is reported as 429 by _rate_limited above instead.
                 return self._error(503, message +

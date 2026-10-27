@@ -105,6 +105,10 @@ class CycleScopeTests(unittest.TestCase):
         self.acc.realm = "intl"
         self.acc.restricted_until = 0.0
         self.acc.can_daily_chat.return_value = True
+        # v0.1.6 起网页活跃会跳过「未验证」账号（它们第一次被触达就会吃 403/11140）。
+        # mock 必须**显式**声明这个状态：MagicMock 的默认返回值是真值，
+        # 不显式设成 False 就会把「已验证」的账号也当成未验证而跳过。
+        self.acc.is_unverified.return_value = False
         self.acc.daily_chat.return_value = {"ok": True, "msg": "ok"}
         self.pool = mock.MagicMock()
         self.pool.dir = self.dir
@@ -145,8 +149,27 @@ class CycleScopeTests(unittest.TestCase):
         self.run_cycle()
         self.acc.daily_chat.assert_not_called()
 
+    def test_unverified_account_is_skipped(self):
+        """未验证账号不做网页活跃（v0.1.6）。
+
+        网页活跃是**唯一会主动向上游发请求**的链路。「从未被上游激活过」的
+        凭据第一次被触达就会拿到 403 / 11140 —— 于是它成了「主动引爆风控」
+        的那一步（2026-10-26 晚的连坐事故里 f7102b2e 就是这样被探出来的）。
+        v0.1.4 的护栏只挡**模型请求**路径，管不到这条独立链路。
+        """
+        self.sched.daily_chat_times = ["23:30"]
+        self.acc.is_unverified.return_value = True
+        self.run_cycle()
+        self.acc.daily_chat.assert_not_called()
+
+    def test_verified_account_still_runs(self):
+        """已验证账号照常跑 —— 闸门不能误伤正常账号。"""
+        self.sched.daily_chat_times = ["23:30"]
+        self.acc.is_unverified.return_value = False
+        self.run_cycle()
+        self.acc.daily_chat.assert_called_once_with(trigger="scheduler")
+
     def test_startup_catchup_runs_once_and_respects_the_switch(self):
-        """启动补跑只消费一次；关掉开关就一个都不补。"""
         self.sched.daily_chat_times = ["23:30"]      # 今天还没到点
         self.run_cycle()
         self.acc.daily_chat.assert_called_once_with(trigger="scheduler")
@@ -160,6 +183,7 @@ class CycleScopeTests(unittest.TestCase):
         acc.realm = "intl"
         acc.restricted_until = 0.0
         acc.can_daily_chat.return_value = True
+        acc.is_unverified.return_value = False
         acc.daily_chat.return_value = {"ok": True, "msg": "ok"}
         self.pool.accounts = [acc]
         self.sched = wb_scheduler.Scheduler(self.pool)
@@ -251,6 +275,8 @@ class HangWatchdogTests(unittest.TestCase):
         acc = mock.MagicMock()
         acc.uid = "58eb0b70-0000-0000-0000-000000000001"
         acc.can_daily_chat.return_value = True
+        # 见 make_account 的同一处说明：mock 必须显式声明「已验证」。
+        acc.is_unverified.return_value = False
         release = threading.Event()
         self.release = release
 

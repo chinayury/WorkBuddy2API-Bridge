@@ -37,6 +37,9 @@ def make_account(uid, realm="intl"):
     acc.realm = realm
     acc.restricted_until = 0.0
     acc.can_daily_chat.return_value = True
+    # v0.1.6 起网页活跃会跳过「未验证」账号。MagicMock 的默认返回值是真值，
+    # 不显式设成 False 就会把正常账号也当成未验证而跳过。
+    acc.is_unverified.return_value = False
     acc.daily_chat.return_value = {"ok": True, "msg": "ok"}
     return acc
 

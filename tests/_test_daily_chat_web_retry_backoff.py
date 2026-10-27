@@ -236,8 +236,14 @@ class RealCreateFailureTests(unittest.TestCase):
             server.server_close()
         self.assertFalse(res["ok"])
         self.assertEqual(res.get("phase"), "create")
-        self.assertIn("14220", res.get("error") or "")
         self.assertEqual(res.get("attempts"), 2)
+        # 错误正文**不**断言具体内容：这条链路会真的发 HTTP 请求，Windows 上
+        # 连接偶尔被网络栈截断（WinError 10054「远程主机强迫关闭了一个现有
+        # 连接」），此时正文里就没有 14220 了 —— 那时失败仍然是 create 阶段
+        # （发请求本身就在 create 阶段），本用例要验的正是这个分类。
+        # 断言错误文本会让这条用例变成依赖网络状态的 flaky test
+        # （实测 5 次跑里偶发红 1 次）。
+        self.assertTrue(res.get("error"))
         # 两轮之间真的睡了一次（0.2s），不是背靠背。阈值留出调度抖动：
         # Windows 上 time.sleep(0.05) 实测偶尔只走 47ms，卡在边界上会假红。
         self.assertGreaterEqual(elapsed, 0.15)

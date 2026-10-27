@@ -563,7 +563,28 @@ class Scheduler:
                 # 3. 如果是国际版账号，检查每日活跃对话 (送 30/50 积分福利)
                 if acc.realm == "intl" and task_active and run_daily_chat:
                     if acc.can_daily_chat():
-                        daily_chat_targets.append(acc)
+                        # **未验证账号不做网页活跃**：这一条链路会**主动**向上游
+                        # 发请求，而「从未被上游激活过」的凭据第一次被触达就会拿到
+                        # 403 / 11140 —— 于是网页活跃成了「主动引爆风控」的那一步。
+                        # v0.1.4 的未验证护栏挡住了**模型请求**路径上的派发，
+                        # 但这里是一条独立的主动链路，护栏管不到它。
+                        # 2026-10-26 晚的连坐事故里，f7102b2e 就是这样被探出来的。
+                        #
+                        # 判据要能吃下「没有 is_unverified 方法的旧账号对象」
+                        # （以及测试里的 mock）—— 那种情况按「已验证」处理，
+                        # 不能因为方法缺失就把账号全跳过了。
+                        unverified = False
+                        checker = getattr(acc, "is_unverified", None)
+                        if callable(checker):
+                            try:
+                                unverified = bool(checker())
+                            except Exception:
+                                unverified = False
+                        if unverified:
+                            self.log(f"⏭ 账号 [{uid8}] 未通过上游验证，"
+                                     "跳过网页活跃（避免主动触发 403/11140）")
+                        else:
+                            daily_chat_targets.append(acc)
             except Exception as exc:
                 # 单个账号的任务失败不能打断整轮巡检：后面还有账号要跑，
                 # 一个坏账号不该让整轮只剩它一个没跑。静默跳过会让「这一轮没跑」
