@@ -9,13 +9,43 @@
 本文件锁住这些约束。
 """
 import os
+import socket
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import wb_alerts
 import wb_settings
+
+#: 解析 `example.com` 时给出的**公网**地址。
+#:
+#: 域名要判定成「公网、允许」，就得**解析得出来** —— 而 v0.1.0 把告警的
+#: 域名解析改成 fail closed（解析不出来 ⇒ 判定为内网 ⇒ 拒绝）。于是这里
+#: 不能依赖真实 DNS：解析不出来时「公网域名应当被允许」这条断言会反过来
+#: 变成「被拒绝」，测试就成了「有没有网」的决定。
+#:
+#: 93.184.216.34 是 example.com 的公网地址段，判定上与真实解析结果一致。
+FAKE_PUBLIC_ADDR = "93.184.216.34"
+
+
+def fake_getaddrinfo(host, port, *args, **kwargs):
+    """把域名解析固定到一个公网地址，不做真实的 DNS 查询。"""
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (FAKE_PUBLIC_ADDR, 0))]
+
+
+def setUpModule():
+    """整个模块期间，域名解析固定成公网地址（不做真实 DNS 查询）。"""
+    patcher = mock.patch.object(wb_alerts.socket, "getaddrinfo",
+                                fake_getaddrinfo)
+    patcher.start()
+    global _dns_patcher
+    _dns_patcher = patcher
+
+
+def tearDownModule():
+    _dns_patcher.stop()
 
 
 class WebhookUrlGuardTest(unittest.TestCase):

@@ -12,14 +12,76 @@
 """
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import wb_alerts
 import wb_settings
+
+#: 解析 `example.com` 时给出的**公网**地址。
+#:
+#: 这里必须固定住，原因有两个：
+#:
+#: 1. **测试不该联网。** 告警的后台投递线程是异步的 —— 某个测试把
+#:    `_post` 换回真实实现之后，worker 才从队列里取走那一项，于是真的去
+#:    连 example.com。测试因此要等真实的 HTTPS 往返（CI 上 4 秒），
+#:    进程退出码还会被解释器收尾时的网络错误带成非 0
+#:    （套件自己报 OK，run_all 却判失败）。
+#: 2. **DNS 失败现在会被拒绝。** v0.1.0 把告警的域名解析改成 fail closed
+#:    （解析不出来 ⇒ 判定为内网 ⇒ 拒绝），所以测试用的域名必须**解析得出来**，
+#:    又不能是真实解析 —— 于是固定成一个公网地址。
+#:
+#: 93.184.216.34 是 example.com 的公网地址段，判定上与真实解析结果一致。
+FAKE_PUBLIC_ADDR = "93.184.216.34"
+
+
+def fake_getaddrinfo(host, port, *args, **kwargs):
+    """把域名解析固定到一个公网地址，不做真实的 DNS 查询。"""
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (FAKE_PUBLIC_ADDR, 0))]
+
+
+#: 真实投递函数在模块运行期间被换掉；这是换掉之前的那一份。
+_real_post = None
+
+
+def _safe_post(url, body, headers=None, timeout=None):
+    """兜底的假投递：worker 线程即使晚到，也绝不会真的发请求。"""
+    return b"ok"
+
+
+def setUpModule():
+    """整个模块期间，投递一律走假实现。
+
+    告警的投递是**后台线程**做的：某个测试把 `_post` 换回真实实现之后，
+    worker 才从队列里取走那一项，于是真的去连 example.com。测试因此要等
+    真实的 HTTPS 往返，进程退出码还会被解释器收尾时的网络错误带成非 0
+    （套件自己报 OK，run_all 却判失败）。
+
+    ⇒ 模块级别把 `_post` 换成假的：worker 无论什么时候取到队列项，
+    都不会出网。投递行为由各测试自己替换 `_post` 来观察。
+    """
+    global _real_post
+    _real_post = wb_alerts._post
+    wb_alerts._post = _safe_post
+
+
+def tearDownModule():
+    wb_alerts._post = _real_post
+
+
+class AlertsTestBase(unittest.TestCase):
+    """所有告警套件共用的前置：DNS 固定、投递不出网。"""
+
+    def setUp(self):
+        patcher = mock.patch.object(wb_alerts.socket, "getaddrinfo",
+                                    fake_getaddrinfo)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 def write_settings(directory, alerts):
@@ -40,7 +102,7 @@ def write_settings(directory, alerts):
         json.dump(data, fh, ensure_ascii=False)
 
 
-class AlertsConfigTest(unittest.TestCase):
+class AlertsConfigTest(AlertsTestBase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb-alerts-cfg-")
         self.addCleanup(wb_alerts.reset)
@@ -84,7 +146,7 @@ class AlertsConfigTest(unittest.TestCase):
         self.assertEqual(cfg["thresholds"]["clear_ticks"], 3)
 
 
-class AlertsDebounceTest(unittest.TestCase):
+class AlertsDebounceTest(AlertsTestBase):
     """去抖：连续命中才发，连续恢复才发恢复。"""
 
     def setUp(self):
@@ -119,7 +181,7 @@ class AlertsDebounceTest(unittest.TestCase):
         self.assertFalse(fired)
 
 
-class AlertsDeliveryTest(unittest.TestCase):
+class AlertsDeliveryTest(AlertsTestBase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb-alerts-del-")
         write_settings(self.tmp, {"webhook": {"url": "https://example.com/h",
@@ -230,7 +292,7 @@ class AlertsDeliveryTest(unittest.TestCase):
                            for_ticks=1, clear_ticks=1, key="q%d" % i)
 
 
-class AlertsSettingsWriteTest(unittest.TestCase):
+class AlertsSettingsWriteTest(AlertsTestBase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb-alerts-set-")
         self.addCleanup(wb_alerts.reset)
