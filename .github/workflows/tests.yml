@@ -4,9 +4,15 @@ name: tests
 # including ones from forks) is covered by pull_request. Listing both events
 # without the branch filter ran each update twice - two full windows + ubuntu
 # matrices for the same commit.
+#
+# `master` is this fork's development branch: the fork keeps upstream's `main`
+# verbatim (for comparison and syncing) and carries our own line on `master`,
+# so `master` has to be listed here too - otherwise no push to the fork's own
+# branch would ever run the matrix and the branch would go unchecked until the
+# next tag.
 on:
   push:
-    branches: [main]
+    branches: [main, master]
     # v* tags run the full matrix plus the tag == source version assertion
     # below, so a release cannot ship a tag that disagrees with the code.
     tags: ["v*"]
