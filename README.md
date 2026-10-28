@@ -1,5 +1,15 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
+> [!NOTE]
+> **本仓库 fork 自 [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（上游 v1.8.0，MIT 协议）。**
+>
+> - **上游仓库**：<https://github.com/ardeyouxipianyi/workbuddy2api-hub> —— 本仓库的基线代码整体来自该仓库；上游 `main` 分支保留在本 fork 内，可随时比对与同步；
+> - **版本编号**：本仓库使用独立的 `0.1.x` 版本线（上游使用 `1.x`），当前版本见 [`VERSION`](VERSION)，逐版发布记录见 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)；
+> - **同步上游**：`git fetch upstream && git merge upstream/main`（`upstream` 指向官方仓库，`origin` 指向本 fork）；
+> - **本 fork 的增量**：账号池治理与未验证账号准入闸门、告警通道 SSRF 防护与密钥打码、限制暂停落盘、调度器整点排程与流式工具调用修复等，详见 `docs/CHANGELOG-v0.1.*.md`。
+>
+> **This repository is a fork of [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub) (upstream v1.8.0, MIT).** The upstream `main` branch is kept in this fork for comparison and syncing. This fork carries its own `0.1.x` version line — see [`VERSION`](VERSION) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
+
 > [!IMPORTANT]
 > **项目进入低频维护（2026-10-23） / Low-frequency maintenance**
 >
@@ -601,6 +611,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 协议兼容、风控规避与任务链路设计过程中，参考并吸纳了以下开源项目的经验与逆向成果：
 
+- **上游项目（本仓库的 fork 来源）**：**[ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)** —— 本仓库整体派生自该仓库（MIT），基线为上游 v1.8.0；除下述各项目的借鉴外，基线代码本身亦来自上游；
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)**：成长任务全链路逆向、设备指纹稳定派生（`derive_id`）、整点排程调度（`Scheduler`）、指纹脱敏与 `reasoning_content` 回填；
 - **[CangShui/workbuddy-cliproxy-fix](https://github.com/CangShui/workbuddy-cliproxy-fix)**：早期客户端代理修复与接口差异参考；
 - **[lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy)** 与 **[mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins)**：网关通信与多插件管理原型参考；
