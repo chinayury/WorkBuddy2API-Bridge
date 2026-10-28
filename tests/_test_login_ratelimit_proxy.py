@@ -74,18 +74,32 @@ class RateLimitKeyTests(unittest.TestCase):
         self.assertEqual(proxy.login_rate_limit_key("127.0.0.1", headers),
                          "203.0.113.7")
 
-    def test_forwarded_for_takes_the_first_hop(self):
+    def test_forwarded_for_takes_the_last_hop(self):
+        """X-Forwarded-For 取**最右**的一段。
+
+        nginx 的 `$proxy_add_x_forwarded_for` 是**追加**：客户端自带的
+        `X-Forwarded-For: 1.2.3.4` 会原样留在最左，代理把真实来源追加到最右。
+        取最左等于**让客户端自己选限流桶** —— 每次登录请求换一个伪造 IP，
+        5 次/60 秒的上限形同虚设。取最右才是代理追加的那一段。
+        """
         headers = {"X-Forwarded-For": "198.51.100.9, 10.0.0.1, 172.16.0.3"}
         self.assertEqual(proxy.login_rate_limit_key("127.0.0.1", headers),
-                         "198.51.100.9")
+                         "172.16.0.3")
+
+    def test_the_client_cannot_choose_its_own_bucket(self):
+        """伪造不同的最左值 ⇒ 仍然是同一个桶（这才是限流的意义）。"""
+        headers_a = {"X-Forwarded-For": "1.1.1.1, 203.0.113.9"}
+        headers_b = {"X-Forwarded-For": "2.2.2.2, 203.0.113.9"}
+        self.assertEqual(proxy.login_rate_limit_key("127.0.0.1", headers_a),
+                         proxy.login_rate_limit_key("127.0.0.1", headers_b))
 
     def test_host_port_forms_are_accepted(self):
         # nginx 的几种变体写法（带端口 / 带方括号的 IPv6）都要认；
-        # X-Forwarded-For 链上第一个带端口同样要认。
+        # X-Forwarded-For 链上带端口的那一段同样要认。
         cases = [
             ("X-Real-IP", "203.0.113.7:443", "203.0.113.7"),
             ("X-Real-IP", "[2001:db8::5]:8443", "2001:db8::5"),
-            ("X-Forwarded-For", "198.51.100.9:443, 10.0.0.1", "198.51.100.9"),
+            ("X-Forwarded-For", "198.51.100.9:443, 10.0.0.1", "10.0.0.1"),
         ]
         for header, raw, want in cases:
             with self.subTest(header=header, raw=raw):
@@ -261,8 +275,13 @@ class LoginFlowTests(unittest.TestCase):
             RIGHT_PASSWORD, {"X-Real-IP": "203.0.113.99"}, attacker)
         self.assertEqual(status, 429)
 
-    def test_forwarded_for_first_hop_is_the_bucket(self):
-        """只有 X-Forwarded-For 时（部分反代形态）按链上第一个地址分桶。"""
+    def test_forwarded_for_bucket_is_not_client_chosen(self):
+        """只有 X-Forwarded-For 时（部分反代形态）按**最右**（代理追加的）分桶。
+
+        这条是限流能不能挡住暴力破解的关键：客户端可以随便改自己带的
+        X-Forwarded-For 左半段，但代理追加在右半段的那一段它改不动 ——
+        所以分桶必须看右半段。旧实现看左半段，等于把限流钥匙交给攻击者。
+        """
         chain_a = {"X-Forwarded-For": "203.0.113.7, 10.0.0.1"}
         chain_b = {"X-Forwarded-For": "203.0.113.8, 10.0.0.1"}
         for _ in range(5):
@@ -270,9 +289,11 @@ class LoginFlowTests(unittest.TestCase):
             self.assertEqual(status, 401)
         status, _ = self.login(WRONG_PASSWORD, chain_a)
         self.assertEqual(status, 429)
-        self.assertIn("203.0.113.7", proxy._login_attempts)
-        status, _ = self.login(RIGHT_PASSWORD, chain_b)
-        self.assertEqual(status, 200)
+        # 桶的键是代理追加的那一段，不是客户端声称的那个。
+        self.assertIn("10.0.0.1", proxy._login_attempts)
+        # 同一个真实来源（同一个桶）—— 只是左半段不同 ⇒ 照样被锁。
+        status, _ = self.login(WRONG_PASSWORD, chain_b)
+        self.assertEqual(status, 429)
 
     def test_window_and_threshold_are_unchanged(self):
         """阈值仍是 5 次 / 60 秒：第 5 次 401、第 6 次才 429，满 60 秒解锁。"""

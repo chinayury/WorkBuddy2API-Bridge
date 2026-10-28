@@ -496,7 +496,10 @@ class ExternalBridgeTests(unittest.TestCase):
                            "pid": 1234, "port": 8788, "root": d}, fh)
             os.chmod(request_file, 0o600)
             with mock.patch.object(E, "run_update", return_value=0) as run:
-                code = E.main(["--request-dir", d])
+                # root 来自执行器自己的 --root，不来自请求文件：
+                # 这段代码跑在特权执行器里，让它按请求文件指定的路径写文件，
+                # 等于把「写哪里」的决定权交给低权限的一方。
+                code = E.main(["--request-dir", d, "--root", d])
             self.assertEqual(code, 0)
             kwargs = run.call_args.kwargs
             self.assertIsNone(kwargs["start_service_fn"])
@@ -504,6 +507,27 @@ class ExternalBridgeTests(unittest.TestCase):
             self.assertEqual(kwargs["status_file"],
                              os.path.join(d, "status.json"))
             self.assertEqual(run.call_args.args[:2], (d, d))
+
+    def test_the_request_cannot_choose_where_the_update_lands(self):
+        """请求文件里的 root **不被采信** —— 特权执行器按自己的配置走。"""
+        import wb_update_external as E
+        with tempfile.TemporaryDirectory() as d:
+            app = os.path.join(d, "app")
+            elsewhere = os.path.join(d, "elsewhere")
+            os.makedirs(app)
+            os.makedirs(elsewhere)
+            for target in (app, elsewhere):
+                with open(os.path.join(target, "wb_proxy.py"), "w") as fh:
+                    fh.write("# app\n")
+            request_file = os.path.join(d, "request.json")
+            with open(request_file, "w", encoding="utf-8") as fh:
+                json.dump({"tag": "v2.0.0", "version": "2.0.0", "pid": 1234,
+                           "port": 8788, "root": elsewhere}, fh)
+            os.chmod(request_file, 0o600)
+            with mock.patch.object(E, "run_update", return_value=0) as run:
+                code = E.main(["--request-dir", d, "--root", app])
+            self.assertEqual(code, 0)
+            self.assertEqual(run.call_args.args[:2], (app, app))
 
     def test_external_executor_passes_the_requested_profile(self):
         import wb_update_external as E
@@ -516,7 +540,7 @@ class ExternalBridgeTests(unittest.TestCase):
                            "port": 8788, "root": d, "profile": "app"}, fh)
             os.chmod(request_file, 0o600)
             with mock.patch.object(E, "run_update", return_value=0) as run:
-                self.assertEqual(E.main(["--request-dir", d]), 0)
+                self.assertEqual(E.main(["--request-dir", d, "--root", d]), 0)
             self.assertEqual(run.call_args.kwargs["profile"], "app")
 
 

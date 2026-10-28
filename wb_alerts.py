@@ -290,9 +290,18 @@ def _is_internal_host(host):
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except (OSError, UnicodeError):
-        # 解析不了：不阻断（DNS 抖动不该让告警彻底不能用），但也不放行到
-        # 「已确认公网」的结论 —— 由投递时的连接失败自然报出来。
-        return False
+        # 解析不了 ⇒ **拒绝**（fail closed）。
+        #
+        # 旧实现在这里 return False（不阻断），理由是「DNS 抖动不该让告警彻底
+        # 不能用」。但这把守与连接是**两次独立的解析**：一个域名可以第一次
+        # 解析失败、第二次解析到 127.0.0.1 —— 校验通过、连接打内网。
+        # 也就是说 fail-open 让这道闸门可以被绕过，而它挡的正是「网关代为
+        # 访问内网」这件事。
+        #
+        # 代价只是「DNS 抖一下时告警发不出去」—— 那是**安全的一侧**：
+        # 收不到告警比被 SSRF 打穿好得多。同仓库的 wb_webtools._guard_url
+        # 本来就是 fail closed 的（:256-259），两处策略现在一致了。
+        return True
     for info in infos:
         raw = str(info[4][0]).split("%")[0]
         try:

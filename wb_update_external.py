@@ -23,8 +23,17 @@ ACTIONS = ("install", "rollback")
 
 
 def read_request(path):
-    """Read and validate one root-owned request, then unlink it."""
+    """Read and validate one root-owned request, then unlink it.
+
+    The open uses O_NOFOLLOW: the request directory is group-writable by
+    design (the unprivileged gateway has to be able to drop a request there),
+    so a symlink named `request.json` could otherwise point this privileged
+    reader at an arbitrary file. `wb_update_request.py` (the writer side)
+    already opens with O_NOFOLLOW — the reader must match it.
+    """
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -94,7 +103,14 @@ def main(argv=None):
         match = TAG_RE.fullmatch(tag)
         if not match or version != "%d.%d.%d" % tuple(int(x) for x in match.groups()):
             raise UpdateError("更新请求版本无效")
-        root = str(payload.get("root") or "").strip() or os.getcwd()
+        # root 来自**执行器自己的配置**（--root / WB_APP_ROOT），不来自请求文件。
+        #
+        # 旧实现读 payload["root"]：那个文件是无特权网关写的，而这段代码跑在
+        # 特权执行器里 —— 让特权进程按请求文件指定的路径去写文件，等于把
+        # 「写哪���」的决定权交给了低权限一方。（同目录的 wb_update_request.py
+        # 就是按「package_root() == app_root()」这种**结构判断**来决定 profile，
+        # 不采信文件里的路径。）
+        root = args.root
         if not os.path.isdir(root) or not os.path.isfile(
                 os.path.join(root, "wb_proxy.py")):
             raise UpdateError("更新目标目录无效: %s" % root)

@@ -207,9 +207,18 @@ def set_alerts(accounts_dir, value):
     """写告警配置。空 dict = 全部关闭（清掉 webhook 与 ServerChan）。
 
     **校验在这里做**（纵深防御）：不只靠调用方校验 —— 任何调用方都拿不到
-    未校验的 dict 落盘。URL 的 scheme / 内网地址检查见 wb_alerts
-    （settings 不 import wb_alerts，避免循环依赖；由调用方负责 URL 校验，
-    这里负责**字段白名单与长度**）。
+    未校验的 dict 落盘。这里负责三件事：
+      1. 字段白名单（多出来的键直接丢掉，不回显给面板）；
+      2. 长度上限；
+      3. **webhook URL 的合法性**（scheme / 内网地址 / userinfo）。
+
+    第 3 条以前是缺的：只有长度检查，于是 `file://`、`http://127.0.0.1/`
+    这类地址能落进 settings.json。投递时那道闸门会挡住它，所以不是可利用
+    的漏洞 —— 但让一个**注定发不出去**的地址躺在配置里，会让「面板保存成功」
+    与「告警根本发不出去」长期对不上号，排查时先怀疑别的。
+
+    延迟 import wb_alerts：settings 不 import alerts（alerts 依赖 settings），
+    延迟导入避开循环依赖。
     """
     if not isinstance(value, dict):
         raise ValueError("alerts must be an object")
@@ -223,6 +232,16 @@ def set_alerts(accounts_dir, value):
                 raise ValueError("webhook URL too long")
             if len(secret) > 512:
                 raise ValueError("webhook secret too long")
+            if url:
+                try:
+                    import wb_alerts
+                except Exception:
+                    wb_alerts = None
+                if wb_alerts is not None:
+                    try:
+                        wb_alerts._assert_webhook_url(url)
+                    except Exception as exc:
+                        raise ValueError("webhook URL 不合法: %s" % exc)
             cleaned["webhook"] = {"url": url, "secret": secret}
     sc = value.get("serverchan")
     if isinstance(sc, dict):
@@ -349,12 +368,48 @@ def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
 # 弄脏缓存。
 _load_cache = {"key": None, "value": {}}
 
+#: 标记键：settings.json **存在但读不出来**（JSON 损坏、权限不对、不是对象）。
+#:
+#: 为什么要有这个标记 —— 「文件不存在」与「文件存在但坏了」在旧实现里是同一件事
+#: （都返回空 dict），后果是：
+#:   1. 面板密码回落成默认的 "admin"（verify_panel_password 看到没有 hash 就认 admin）；
+#:   2. API Key 列表变空 ⇒ auth_required() 判定为「不需要鉴权」⇒ 网关对所有能
+#:      碰到端口的人开放（/v1/chat/completions 直接可调，消耗上游账号的额度）；
+#:   3. 每日限额/积分限额一并回落到默认值 —— 保护在最需要的时候没了；
+#:   4. 更糟的是第一次面板写入会用这个空 dict **覆盖**坏文件 ⇒ API Key 与密码
+#:      哈希彻底丢失，回不来了。
+#:
+#: 所以：文件存在但读不出来时，**必须 fail closed** —— 拒绝面板登录、要求 API Key，
+#: 并且不许用空内容覆盖原文件。
+_UNREADABLE = "__settings_unreadable__"
+
+
+def settings_unreadable(accounts_dir):
+    """settings.json 存在但读不出来（损坏/权限/非对象）。
+
+    调用方据此 fail closed。这个判定自己再读一次盘（不依赖缓存），
+    因为「刚才还好好的」与「现在坏了」必须能区分开。
+    """
+    path = settings_path(accounts_dir)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            parsed = json.load(fh)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    return not isinstance(parsed, dict)
+
 
 def load(accounts_dir):
     """Return the persisted settings, or an empty dict on a fresh install.
 
     Cached on (path, mtime, size); the returned dict is a fresh top-level copy
     so callers keep the previous "mutate freely" semantics.
+
+    A file that exists but cannot be parsed is NOT treated as "no settings":
+    see `_UNREADABLE` above — failing open there would hand the gateway to
+    anyone who can reach the port.
     """
     path = settings_path(accounts_dir)
     try:
@@ -371,20 +426,34 @@ def load(accounts_dir):
             parsed = json.load(fh)
         if isinstance(parsed, dict):
             data = parsed
+        else:
+            # 存在但不是一个 JSON 对象：与损坏同等对待。
+            data = {_UNREADABLE: True}
     except FileNotFoundError:
         pass
     except Exception:
-        pass
+        # 存在但读不出来（损坏/权限/编码）：标记出来，让安全判定 fail closed。
+        data = {_UNREADABLE: True}
     with _lock:
         _load_cache.update({"key": key, "value": data})
     return dict(data)
 
 
 def save(accounts_dir, data):
-    """Atomic write so a crash cannot leave a half-written settings file."""
+    """Atomic write so a crash cannot leave a half-written settings file.
+
+    Refuses to overwrite an unreadable settings file with content that carries
+    no credentials: the panel's first write after a corruption used to persist
+    the empty dict it had read, which destroyed the API keys and the password
+    hash for good. The damaged file is kept alongside as `.corrupt` so it can
+    be inspected (and recovered) instead of being silently replaced.
+    """
     with _lock:
         os.makedirs(accounts_dir, exist_ok=True)
         path = settings_path(accounts_dir)
+        # 坏文件不许被空内容覆盖：那次写入会把 API Key 与密码哈希一起抹掉。
+        if isinstance(data, dict) and data.get(_UNREADABLE):
+            raise RuntimeError("settings.json is unreadable; refusing to write")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
@@ -396,6 +465,27 @@ def save(accounts_dir, data):
         # 改写的下一个 load() 一定重新读盘。
         _load_cache["key"] = None
         return path
+
+
+def quarantine_unreadable(accounts_dir):
+    """把读不出来的 settings.json 复制成 .corrupt 留档，返回副本路径。
+
+    不删原文件、不动它的内容 —— 恢复要靠人来看这份副本。
+    """
+    path = settings_path(accounts_dir)
+    try:
+        with open(path, "rb") as src:
+            blob = src.read()
+    except Exception:
+        return None
+    target = path + ".corrupt"
+    try:
+        with open(target, "wb") as dst:
+            dst.write(blob)
+        wb_atomic.tighten_mode(target)
+    except Exception:
+        return None
+    return target
 
 
 def deep_merge(base, patch):
@@ -418,15 +508,25 @@ def deep_merge(base, patch):
 
 def panel_password_is_default(accounts_dir):
     data = load(accounts_dir)
+    if data.get(_UNREADABLE):
+        # 读不出来时不能说「还是默认密码」—— 那是在替一个未知状态背书。
+        return False
     if not data.get("panel_password_hash"):
         return True
     return data.get("panel_password_default") is True
 
 
 def verify_panel_password(accounts_dir, password):
-    """True when `password` opens the web panel."""
+    """True when `password` opens the web panel.
+
+    Fail closed on an unreadable settings file: falling back to "admin" there
+    would let anyone who can reach the port walk into a panel whose stored
+    credentials we simply failed to read.
+    """
     password = password or ""
     data = load(accounts_dir)
+    if data.get(_UNREADABLE):
+        return False
     stored = data.get("panel_password_hash")
     if not stored:
         return password == DEFAULT_PANEL_PASSWORD

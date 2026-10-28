@@ -1,6 +1,10 @@
-# WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
+# WorkBuddy2API-Bridge — 国际版、国内版多账号网关中枢
 
 > [!NOTE]
+> **本项目名称：WorkBuddy2API-Bridge。** 上游项目名为 WorkBuddy2API-Hub，本 fork 使用独立名称以避免混淆；
+> 代码标识符、镜像名 `workbuddy2api-hub`、compose 服务名 `wb-proxy` 与 HTTP `Server` 头 `wb-proxy/<版本>` **保持不变**，
+> 以免影响既有部署与升级链路。
+>
 > **本仓库 fork 自 [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（上游 v1.8.0，MIT 协议）。**
 >
 > - **上游仓库**：<https://github.com/ardeyouxipianyi/workbuddy2api-hub> —— 本仓库的基线代码整体来自该仓库；上游 `main` 分支保留在本 fork 内，可随时比对与同步；
@@ -186,24 +190,11 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 209 个套件：156 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：157 个 Python + 54 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：157 个 Python + 54 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 226 个套件：167 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：157 个 Python + 54 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 212 个套件：158 个 Python + 54 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 227 个套件：168 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 228 个套件：169 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 229 个套件：170 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 231 个套件：172 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
-- 232 个套件：173 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 241 个套件：182 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
+- 架构说明见 **[docs/ARCHITECTURE-v0.1.0.md](docs/ARCHITECTURE-v0.1.0.md)** —— 请求生命周期、协议适配、流式管线、账号池、调度器、控制面与发布工程的事实性说明（每条结论对应真实文件与行号）。
+- v0.1.0 正式版的其余文档：**[项目介绍](docs/README-v0.1.0-formal.md)** · **[变更日志](docs/CHANGELOG-v0.1.0-formal.md)** · **[BUG 修复清单](docs/BUGFIXES-v0.1.0-formal.md)** · **[安全审查报告](docs/SECURITY-v0.1.0-formal.md)** · **[部署与升级](docs/DEPLOY-v0.1.0-formal.md)** · **[使用说明](docs/USAGE-v0.1.0-formal.md)**
 
 ---
 

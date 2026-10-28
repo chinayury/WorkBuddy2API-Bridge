@@ -78,7 +78,6 @@ POLL_SECONDS = 300
 # 一律跳过：猜一个顺序比不报更糟。
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
-
 def parse_version(text):
     """vX.Y.Z / X.Y.Z -> (major, minor, patch)；其它一律 None。"""
     match = VERSION_RE.match(str(text or "").strip())

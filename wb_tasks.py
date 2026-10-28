@@ -92,6 +92,16 @@ DESKTOP_ONLY_TASKS = {
 # 夜猫子任务只在 23:00-08:00 上报才计数, 且每天 1 次、累计 3 天。
 NIGHT_TASK_CODES = {"black_cat"}
 
+#: 上报事件之后等进度落账的窗口。
+#:
+#: 实测的落账延迟（见本文件 :85-88 的实测记录）：RichMeow 0/1→1/1 约 3 秒，
+#: Library_read 4 秒。窗口小于 4 秒就会有一半任务当天领不到奖 ——
+#: 领奖顺延到明天，一次奖励静默丢失。所以窗口取 20 秒。
+PROGRESS_POLL_TIMEOUT = 20.0
+#: 轮询间隔。2 秒足够快（落账 3-4 秒 ⇒ 2-3 次就够），
+#: 也不会给上游造成压力（一轮任务是顺序跑的）。
+PROGRESS_POLL_INTERVAL = 2.0
+
 def in_night_window():
     h = time.localtime().tm_hour
     return h >= 23 or h < 8
@@ -175,6 +185,11 @@ def fetch_growth_tasks(account):
                 })
             return tasks
     except Exception as exc:
+        # 记一笔日志：否则「上游改了接口」与「今天没有任务」在面板上完全一样
+        # ——都表现为空列表，排查时只能靠猜。模块里其它查询
+        # （fetch_growth_summary / fetch_streak_days …）都记了日志，
+        # 只有这里漏了。
+        _log(f"growth/tasks query failed: {exc}")
         return []
 
 
@@ -813,11 +828,15 @@ def do_cat_travel(account):
     return {"ok": True, "action": state, "msg": f"当前状态: {state}"}
 
 
-def _progress_one(account, t, logs, gap, claim=True):
+def _progress_one(account, t, logs, gap, claim=True, skip_night=False):
     """推进单个任务并返回本次到账积分。
 
     auto 类任务不需要接取（上游 "task does not require acceptance"），事件可
     直接点亮；single 类未接取时上报不计进度，跳过等接取成功。
+
+    `skip_night=True` 时夜猫子任务交给 `run_night_growth` 独占处理（见
+    `run_growth_tasks` 的说明）：调度器的 01:00 槽位两条路都会跑，
+    不分开就会一晚上报 3~4 次，而上游的契约是每天 1 次。
     """
     code = t["task_code"]
     spec = TASK_SPECS.get(code)
@@ -884,10 +903,17 @@ def _progress_one(account, t, logs, gap, claim=True):
         return 0
 
     # 夜猫子任务只在 23:00-08:00 计数 (每日 01:00 调度器也会自动执行)
-    if code in NIGHT_TASK_CODES and not in_night_window():
-        logs.append(f"🌙 任务 [{name}] 仅 23:00-08:00 上报计数, 当前不在窗口, 跳过"
-                    f" (每日 01:00 调度器自动执行, 累计 3 天)")
-        return 0
+    if code in NIGHT_TASK_CODES:
+        if skip_night:
+            # 夜间任务由 run_night_growth 独占：01:00 槽位两条路都会跑，
+            # 这边再报一次就是一晚上 3~4 次，而上游契约是每天 1 次。
+            logs.append(f"🌙 任务 [{name}] 由夜间任务独占处理, 本轮跳过"
+                        f" (每日 01:00 累计 3 天)")
+            return 0
+        if not in_night_window():
+            logs.append(f"🌙 任务 [{name}] 仅 23:00-08:00 上报计数, 当前不在窗口, 跳过"
+                        f" (每日 01:00 调度器自动执行, 累计 3 天)")
+            return 0
 
     if status == "not_accepted" and t.get("task_type") != "auto":
         # 接取没成功就上报是白费功夫: 上游只对已接取的任务累计进度。
@@ -929,23 +955,28 @@ def _progress_one(account, t, logs, gap, claim=True):
         logs.append(f"! 任务 [{name}] 部分事件上报失败 (上游拒绝), 继续尝试领奖")
     time.sleep(1.5)
 
-    # 等上游把进度落账再领奖。进度通常 1-3 秒就可见, 因此先快查几次;
-    # 只有确实在动才继续等, 免得每个卡住的任务都空等 20 秒 (整轮要几分钟)。
+    # 等上游把进度落账再领奖。
+    #
+    # 窗口必须是**明确的截止时间**，而不是「数几次」：
+    # 旧写法 `for attempt in range(6)` 看着像等 6 次，但它在 attempt==2 时
+    # 就 break 了 —— 实际只等 3.0 秒。而这个文件自己记着实测：
+    # 「Library_read 4 秒点亮」「RichMeow 0/1→1/1 约 3 秒」（:457-461）。
+    # 也就是说 **有一半的任务正好落在这 3 秒之外** —— 进度没赶上就领不到奖，
+    # 领奖顺延到**明天**（一次任务的奖励就这样静默丢了，日志只写一句
+    # 「已上报但进度 0/1 未达成」）。
+    #
+    # 改成「在截止时间前一直查」：进度一到位就停，查到上限就顺延。
+    # 上限 20 秒足够覆盖 4-5 秒的落账延迟；整轮任务是顺序跑的，
+    # 多等的几秒换取「当天就能领奖」是划算的。
+    deadline = time.time() + PROGRESS_POLL_TIMEOUT
     prog = cur
-    for attempt in range(6):
+    while time.time() < deadline:
         fresh = next((x for x in fetch_growth_tasks(account) if x["task_code"] == code), None)
         if fresh:
             prog = fresh.get("current", 0)
             if prog >= tgt or fresh.get("status") in ("completed", "claimed"):
                 break
-            if prog > cur:
-                # 已经在涨了, 值得多等一会儿
-                time.sleep(2.5)
-                continue
-        if attempt < 2:
-            time.sleep(1.5)
-        else:
-            break
+        time.sleep(PROGRESS_POLL_INTERVAL)
     if prog < tgt:
         logs.append(f"? 任务 [{name}] 已上报但进度 {prog}/{tgt} 未达成, 领奖顺延到下次运行")
         time.sleep(gap)
@@ -967,10 +998,19 @@ def _progress_one(account, t, logs, gap, claim=True):
     return 0
 
 
-def run_growth_tasks(account, gap=1.0, claim=True):
+def run_growth_tasks(account, gap=1.0, claim=True, skip_night=False):
     """完整执行批量成长任务点亮与领奖。
 
     claim=False 只推进进度、不领奖，让用户自己挑时间领取（#507）。
+
+    `skip_night=True` 让夜猫子任务（black_cat）完全交给 `run_night_growth` 负责。
+
+    为什么需要它：调度器的 01:00 槽位**同时**跑 `run_night_growth` 与
+    `run_growth_tasks`（wb_scheduler.py 的 cat_hours 与 growth_hours 都是 [1]）。
+    前者报 1 次夜间事件，后者又在 `_progress_one` 里看到「现在是夜间窗口」
+    ⇒ 再补报 `tgt - cur` 次 —— 一晚 3~4 次，而上游的契约是**每天 1 次、
+    累计 3 天**。多余的次数要么被上游忽略（白花流量），要么让进度算错。
+    ⇒ 夜间任务由夜间那条路独占。
     """
     if account.realm != "cn":
         return {"ok": False, "msg": "国际版不适用国内成长任务中心", "logs": []}
@@ -992,7 +1032,8 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     #    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
     for t in tasks:
         if t.get("task_type") == "auto":
-            total_earned += _progress_one(account, t, logs, gap, claim=claim)
+            total_earned += _progress_one(account, t, logs, gap, claim=claim,
+                                           skip_night=skip_night)
 
     # 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化）
     def _needs_accept(x):
@@ -1034,7 +1075,8 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     for t in tasks:
         if t.get("task_type") == "auto":
             continue
-        total_earned += _progress_one(account, t, logs, gap, claim=claim)
+        total_earned += _progress_one(account, t, logs, gap, claim=claim,
+                                       skip_night=skip_night)
 
     # 3. 顺手检查猫猫旅行
     tr_res = do_cat_travel(account)

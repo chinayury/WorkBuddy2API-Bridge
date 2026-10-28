@@ -171,7 +171,12 @@ def _timestamp():
 
 def _parse_ts(value):
     try:
-        return datetime.datetime.fromisoformat(str(value)).timestamp()
+        text = str(value)
+        # Python 3.9/3.10 的 fromisoformat 不认末尾的 "Z"（UTC 记法），
+        # 3.11+ 才支持。把它换成 "+00:00" —— 语义完全一样，两边都能解析。
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        return datetime.datetime.fromisoformat(text).timestamp()
     except Exception:
         return None
 

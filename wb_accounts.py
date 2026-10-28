@@ -754,6 +754,95 @@ DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
 # 与其它冷却不同，这个期限是**持久化**的（见 note_restricted）。
 RESTRICTED_ACCOUNT_COOLDOWN = 7200.0
 
+#: 半开探测的两个时间窗（借鉴 Coding2API src/engine/half_open.py:41-101）：
+#: - 试探进行中超过这个时长 ⇒ 认为上次试探没有结论（进程被杀、客户端断开），
+#:   放行下一个请求，避免账号被永久卡在半开态里；
+#: - 试探成功后在这个 TTL 内直接放行，不再重复试探（上游的恢复不是瞬间的，
+#:   但也没必要每次请求都再打一次试探）。
+HALF_OPEN_PROBE_TIMEOUT = 120.0
+HALF_OPEN_RECOVERED_TTL = 120.0
+
+
+# ---------------------------------------------------------------------------
+# 上游错误的分类（借鉴 Coding2API 的 ErrKind 体系）
+# ---------------------------------------------------------------------------
+#
+# 为什么要分类：同一句「请求失败」对账号的含义并不一样。
+#   - 凭据被拒（403 / 11140 / 刷新后仍 401）→ 该账号确实不该再接单，要冷却；
+#   - 模型/额度维度的问题（429 / 6004 / 14003）→ 是**这个模型**的问题，
+#     不是这个账号的问题，账号不该背锅；
+#   - 请求本身有问题（400 / 参数非法）→ 是**客户端**的错，账号完全无辜；
+#   - 排队/瞬时 → 不是失败，不该计入任何失败计数。
+#
+# 老实现在这几档上的区分是「有就分开处理，没有就一律冷却」：
+# 任何一次 401（哪怕是上游代理/WAF 偶发返回的）刷新失败后都会给账号记 60 秒冷却，
+# 任何一次连接层异常都会喂熔断计数。误伤的代价是：救火的时候又摘掉一批号，
+# 池子容量���降 —— 2026-10-26 晚的连坐事故里就有这类误伤。
+#
+# 分类的目的：**让不该背锅的失败真的不背锅**，而不是换个地方记。
+
+#: 凭据被拒：账号确实不可用，冷却它是对的。
+ERR_CREDENTIAL = "credential"
+#: 模型/额度维度：账号本身没问题，别动它。
+ERR_MODEL = "model"
+#: 请求本身的问题：客户端的错，账号不该背锅。
+ERR_REQUEST = "request"
+#: 排队/瞬时：不是失败，不计任何计数。
+ERR_TRANSIENT = "transient"
+#: 本机网络不可用：上游一个字节都没收到。
+ERR_LOCAL_NETWORK = "local_network"
+
+#: 不惩罚账号的分类：这些只记录、不冷却、不喂熔断计数。
+NON_PENALIZING = frozenset((ERR_REQUEST, ERR_TRANSIENT, ERR_LOCAL_NETWORK))
+
+
+def _upstream_code_from_detail(detail):
+    """从上游错误正文里取业务 code（没有就 None）。
+
+    只认 JSON 正文里的 `code` 字段（整数）——**不做裸数字子串匹配**：
+    「11140」出现在别的字段或文案里，不代表是 11140。正文不是 JSON 时返回 None。
+    """
+    try:
+        payload = json.loads(detail or "")
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return int(payload.get("code"))
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_upstream_error(status=None, code=None, detail=""):
+    """把一次上游失败归到上面五类之一。
+
+    `status` 是 HTTP 状态码，`code` 是上游正文里的业务 code（如 11140），
+    `detail` 是正文原文。判定顺序有意义：**业务 code 优先于 HTTP 状态码** ——
+    403 + 11140 是账号级风控（凭据类），429 + 14003 是被限流（模型类），
+    两者 HTTP 状态相同但含义相反。
+    """
+    text = str(detail or "")
+    if code is None:
+        code = _upstream_code_from_detail(text)
+
+    # 账号级风控：上游明确判这个凭据非法。
+    if code == 11140 or (status == 403 and "11140" in text):
+        return ERR_CREDENTIAL
+    # 限流类：额度/频率维度，账号没坏。
+    if status == 429 or code in (6004, 14003):
+        return ERR_MODEL
+    # 客户端请求本身的问题：参数非法、模型名不对、内容不合规。
+    if status in (400, 404, 405, 409, 422):
+        return ERR_REQUEST
+    # 凭据被拒：401（刷新失败后）或 402。
+    if status in (401, 402):
+        return ERR_CREDENTIAL
+    # 5xx：上游自己的问题，换号有用，但它说明「这条路不健康」，账号记一笔软失败。
+    if status is not None and status >= 500:
+        return ERR_TRANSIENT
+    return ERR_TRANSIENT
+
 
 def _exponential_backoff(count, base, cap, offset):
     """base * 2 ** (count - offset), clamped to cap and to 20 steps."""
@@ -1022,6 +1111,20 @@ class Account(object):
         self.last_fail_at = 0.0
         # 最近一次软限流（429）的时刻：两条软限流阶梯用同一个时间窗。
         self.last_soft_at = 0.0
+        # 半开探测（借鉴 Coding2API 的 half_open.py）。
+        #
+        # 问题：冷却一到期，**所有**并发请求会同时压到刚解冻的同一个账号上，
+        # 于是形成「冷却 60s → 到期 → 全员压上 → 再撞 → 再冷却」的锯齿。
+        # 上游按「账号 + 分钟」计 token，这一撞就可能再破配额。
+        #
+        # 做法：冷却到期后账号进入半开态，只有**一个**在途请求被放去试探，
+        # 其余请求改选别的账号。试探成功 ⇒ 标记为已恢复（TTL 内不再重复试探）；
+        # 试探失败 ⇒ 回到冷却。
+        #
+        # 键是 (uid, 模型)：模型级冷却与账号级冷却要分开半开，否则一个模型
+        # 的冷却会把整个账号的其它模型也挡住。
+        self._half_open = {}
+        self._half_open_lock = threading.Lock()
         self.credits = data.get("credits") or None
         # 账号档位，来自计费摘要（#505）：{paid, package, package_code,
         # protected_price, trial, checked_at, source}。企业账号不写——上游对
@@ -1785,7 +1888,13 @@ class Account(object):
             return False
         return str(model).strip().lower() in self.disabled_models
 
-    def ready(self, model=None):
+    def ready(self, model=None, refresh=True):
+        """这个账号现在能不能接单。
+
+        `refresh=False` 去掉令牌刷新这个**副作用**：账号池的选号路径要用它
+        扫过整个池子，带副作用的话一次派发会对每个临期账号各发一次网络请求。
+        详见令牌到期那段注释。
+        """
         if not self.enabled or not self.access_token or getattr(self, "token_expired", False):
             return False
         # 未验证账号的隔离闸门（借鉴 P1-8 的入池闸门）。
@@ -1840,6 +1949,14 @@ class Account(object):
         remaining = exp - time.time()
         if remaining > 120:
             return True
+        # 令牌快到期了。refresh=False 时**不**去刷新，直接判定为不可用 ——
+        # 选号路径会用它来扫过整个账号池，而 ready() 带刷新副作用时，
+        # 一次派发会对每个临期账号各发一次网络请求（19 个账号 = 19 次串行
+        # 刷新，每次最长 30 秒）。旧实现只扫到第一个可用账号就停，
+        # 所以只有一次刷新；改成先收集全部候选后这个副作用被放大了。
+        # 带刷新副作用的判定留给真正要用这个账号的那一步（见 open_upstream）。
+        if not refresh:
+            return False
         if remaining > 0:
             # Refresh is a last resort and its result decides availability.
             # Returning True unconditionally here kept handing out an account
@@ -1847,6 +1964,23 @@ class Account(object):
             # stale credential and came back 401/403.
             return self.refresh()
         return self.refresh()
+
+    def token_needs_refresh(self, within=120.0):
+        """这个账号的令牌是不是快到期了（该刷新一次）。
+
+        与 ready() 里那个 120 秒窗口是同一个判据，但**没有副作用** ——
+        它只读，不发起网络请求。选号路径用它做「只看不用」的判定，
+        真正要用这个账号时（wb_proxy.open_upstream）才真的去刷新。
+        """
+        if self.is_api_key:
+            # 静态 Key 长期有效，不存在刷新。
+            return False
+        if not self.refresh_token:
+            return False
+        exp = self.expires_at or jwt_exp(self.access_token)
+        if not exp:
+            return False
+        return (exp - time.time()) <= float(within)
 
     def is_cli_identity(self):
         """出站身份是不是官方 CodeBuddy CLI（决定 chat 的 wire 形态）。"""
@@ -3440,14 +3574,35 @@ class Account(object):
             self.last_error_detail = ""
 
     def note_error(self, message, cooldown=60, single_account=False, model=None, until=None,
-                   detail=None):
+                   detail=None, penalty=ERR_CREDENTIAL):
+        """记一次失败。
+
+        `penalty` 是这次失败对账号的**含义**（见 classify_upstream_error 的五类）：
+          - ERR_CREDENTIAL：凭据被拒，冷却它是对的（默认，保持旧行为）；
+          - ERR_MODEL：模型/额度维度的问题 —— 账号本身没问题；
+          - ERR_REQUEST：客户端请求本身的问题 —— 账号完全无辜；
+          - ERR_TRANSIENT / ERR_LOCAL_NETWORK：排队或本机网络问题 —— 不是失败。
+
+        非惩罚类**只记录、不冷却**：不设 cooldown_until，也不碰熔断计数。
+        这不是新造出来的语义 —— 旧调用点用 `cooldown=0` 表达「别冷却这个账号」，
+        但那是**隐式**的：读代码的人看不出 cooldown=0 是「不冷却」还是「冷却 0 秒」，
+        而且它拦不住别处再记一次失败。现在把它变成显式的分类参数。
+
+        注意：这里不碰 `fails`（熔断计数）—— 那是 note_failure / note_unknown_failure
+        的职责。note_error 只负责「冷却窗口」。
+        """
         with self._throttle_lock:
             self.last_error = str(message)[:200]
             # The visible label keeps its existing truncation; `detail` carries the
             # untouched upstream body so the panel can show it on hover.
             self.last_error_detail = str(detail)[:2000] if detail else ""
-            if _auth_failure_text(message):
+            if penalty not in NON_PENALIZING and _auth_failure_text(message):
                 self.token_expired = True
+            if penalty in NON_PENALIZING:
+                # 不惩罚：只留下「发生过」的痕迹，账号继续可用。
+                # model 作用域的冷却在这里也不设 —— 那是「这个模型不行」，
+                # 与这次失败是不是惩罚性的无关，调用方要设就单独调 arm_model_cooldown。
+                return
             if model:
                 # Model-scoped throttle: keep the account usable for every other model.
                 wait = max(1.0, float(until) - time.time()) if until else (
@@ -3701,6 +3856,110 @@ class Account(object):
                 self.breaker_until = max(self.breaker_until, now + wait)
         return self.degrade_until
 
+    # ------------------------------------------------------------------
+    # 半开探测（half-open probe）
+    # ------------------------------------------------------------------
+    #
+    # 借鉴 Coding2API `src/engine/half_open.py:41-101`。他们的问题描述可以直接
+    # 拿来用：*"冷却一到期……所有并发请求会同时压到同一个刚解冻的号上……
+    # 形成「冷却 60s → 到期 → 再撞 → 再冷却」的锯齿。"*
+    #
+    # 我们这里的对应问题更具体：上游按「账号 + 分钟」计 token，一个大上下文会话
+    # 单请求就带十几万 token。冷却到期的瞬间所有并发请求一起压上去，这一分钟就
+    # 可能冲破配额，然后整池进入新一轮冷却。
+
+    def _half_open_key(self, model=None):
+        return (self.uid, model or "")
+
+    def half_open_probe(self, model=None):
+        """半开态的「准入令牌」：拿到 True 的那个请求负责去试探。
+
+        语义：
+          - 账号当前没有任何冷却窗口 ⇒ 直接放行（不是半开情形）；
+          - 冷却刚到期（窗口从 >0 变成 0）⇒ 进入半开，**只有第一个**拿到令牌；
+          - 已经在半开且试探还没结束 ⇒ 不给令牌（其余请求改选别的账号）；
+          - 试探成功过（TTL 内）⇒ 直接放行，不再重复试探。
+
+        返回 True 不代表「这个账号一定能用」，只代表「允许试一次」。
+        """
+        now = time.time()
+        key = self._half_open_key(model)
+        with self._half_open_lock:
+            state = self._half_open.get(key)
+            if state is None:
+                # 第一次试探：登记「进行中」，这样并发的第二个请求就拿不到令牌。
+                self._half_open[key] = (now, False)
+                return True
+            probed_at, recovered = state
+            if recovered:
+                # 试探成功后的恢复期：放行，但不再重复试探。
+                if now - probed_at > HALF_OPEN_RECOVERED_TTL:
+                    # TTL 过了 ⇒ 重新进入「试探进行中」，**并把标记重新架起来**。
+                    # 旧写法是 pop 掉就返回 True：那样第二个并发请求会看到
+                    # state is None，自己架一个试探并同样拿到令牌 ——
+                    # 一个恢复期结束的瞬间会发出**两个**试探令牌。
+                    self._half_open[key] = (now, False)
+                    return True
+                return True
+            # 试探进行中：只放第一个。
+            if now - probed_at > HALF_OPEN_PROBE_TIMEOUT:
+                # 上一个试探迟迟没有结论（进程被杀、客户端断开）：放行下一个，
+                # 否则这个账号会被永久卡在半开态里，谁也拿不到它。
+                self._half_open[key] = (now, False)
+                return True
+            return False
+
+    def half_open_settled(self, ok, model=None):
+        """半开试探的结论。
+
+        `ok=True` ⇒ 账号恢复，TTL 内直接放行；
+        `ok=False` ⇒ 试探失败：这个 (账号, 模型) 的半开**结束** —— 状态被清掉，
+        下一个请求可以重新拿到令牌再试一次（冷却窗口由调用方按原有逻辑重新设置）。
+
+        这里必须区分「失败」与「还没结论」：
+          - 失败 ⇒ 明确知道这个号还是不行 ⇒ 结束半开，把机会让给下一个请求；
+          - 还没结论（请求还在跑）⇒ 保持「进行中」，其余请求继续绕开。
+        """
+        now = time.time()
+        key = self._half_open_key(model)
+        with self._half_open_lock:
+            if ok:
+                self._half_open[key] = (now, True)
+            else:
+                # 试探失败：结束半开状态，下一个请求可以再试。
+                self._half_open.pop(key, None)
+
+    def half_open_clear(self, model=None):
+        """清掉半开状态（账号被重新冷却、或成功路径把它彻底治好时）。"""
+        key = self._half_open_key(model)
+        with self._half_open_lock:
+            self._half_open.pop(key, None)
+
+    def half_open_is_recovered(self, model=None):
+        """这个账号的半开试探是否已经成功过。
+
+        成功过的账号被证明能用，不该继续在选号时让路。TTL 过了之后
+        恢复标记自动失效（那时它又会重新变成半开候选 —— 这是对的：
+        很久没被验证过的账号仍然值得再探一次）。
+
+        **model 必须与调用方一致**：半开状态是按 (uid, 模型) 分开的，
+        用 model=None 去查一个按真实模型名写下的标记永远查不到
+        （那会让「已恢复」这个逃生口形同虚设）。
+        """
+        key = self._half_open_key(model)
+        now = time.time()
+        with self._half_open_lock:
+            state = self._half_open.get(key)
+            if state is None:
+                return False
+            probed_at, recovered = state
+            if not recovered:
+                return False
+            if now - probed_at > HALF_OPEN_RECOVERED_TTL:
+                self._half_open.pop(key, None)
+                return False
+            return True
+
     def note_success(self, model=None):
         """A served request clears every account-level penalty.
 
@@ -3735,6 +3994,9 @@ class Account(object):
             self.last_error_detail = ""
             self.cooldown_until = 0.0
             self.token_expired = False
+        # 上游真的把这个号服务出去了：半开试探成功 ⇒ 该账号恢复。
+        # （半开是运行时态，不落盘；重启即清零，本来也不需要跨重启存活。）
+        self.half_open_settled(True, model=model)
         # 上游真的把这个号服务出去了：这是「凭据被上游接受」的直接证据，
         # 护栏据此解除（见 mark_verified / is_unverified）。这是唯一的解除条件
         # —— 本地推断不能替代上游事实。
@@ -4163,7 +4425,44 @@ class AccountPool(object):
         self._page_cursors = {}
         # uid 排序表的缓存：池成员没变就直接复用，变了重建（见 _page_ranks）。
         self._page_order_cache = None
+        # 每个账号**见过的最早冷却到期时刻**（uid -> epoch）：用来判断「它是不是
+        # 刚从冷却里恢复」。见 _is_freshly_recovered。派生值，不落盘。
+        self._recovery_deadlines = {}
         self.affinity = SessionAffinity()
+        # 在途数（inflight）快照的取值入口。wb_proxy 持有真正的计数器，但它
+        # import 本模块 —— 反向 import 会成环，所以这里放一个可注入的只读
+        # 提供者：wb_proxy 在启动时把取值函数塞进来，池在选号时用它排序。
+        # 没注入（单元测试、脚本直接用池）时一律当成 0，选号与从前完全一致。
+        self._inflight_provider = None
+
+    def set_inflight_provider(self, provider):
+        """注册「某账号当前在途请求数」的只读取值函数。
+
+        `provider(uid) -> int`。传 None 取消注册（回到无此偏好的行为）。
+        注册方（wb_proxy）自己负责线程安全；本模块只在选号时读一次。
+        """
+        with self._lock:
+            self._inflight_provider = provider
+
+    def _inflight_of(self, account):
+        """这个账号当前在途多少个请求；取不到就当 0。
+
+        拿不到时的选择是「当 0」而不是「当很大」：在途数只是**次级**排序键，
+        读不到时把它当 0 等于退回纯轮询，而当成无穷大会把这个账号永久排到最后。
+        """
+        provider = self._inflight_provider
+        if provider is None:
+            return 0
+        try:
+            value = provider(account.uid)
+        except Exception:
+            # 取值函数是外部注入的，不能让它把整个派发带崩。
+            return 0
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return value if value > 0 else 0
 
     def load(self):
         with self._lock:
@@ -4713,7 +5012,7 @@ class AccountPool(object):
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot
-                   if a.enabled and a.access_token and a.ready(model=model)
+                   if a.enabled and a.access_token and a.ready(model=model, refresh=False)
                    and (allowed is None or a.uid in allowed))
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
@@ -4745,7 +5044,7 @@ class AccountPool(object):
                 if allowed is not None and uid not in allowed:
                     continue
                 account = self.get(uid)
-                if account and account.realm == realm and account.ready(model=model):
+                if account and account.realm == realm and account.ready(model=model, refresh=False):
                     self.affinity.bind(session_key, uid)
                     return account
         account = self.pick(realm=realm, exclude=exclude, model=model, page=page,
@@ -4785,9 +5084,33 @@ class AccountPool(object):
         # 流量也多，但同层之内仍有轮转，谁也不独占。它们此刻都不可用（冷却、
         # 限额、被排除）时照旧落回下面的自动偏好与轮询，一条偏好卡不住池子。
         # 全部权重都是 1（默认）时这一层直接返回 None，分派与从前完全一致。
-        account = self._pick_weighted_first(snapshot, exclude, model)
-        if account is not None:
-            return account
+        #
+        # **在途感知会穿透偏好层**：权重是「同等条件下先给谁」的偏好，
+        # 不是「独占」。如果带权重的账号此刻已经背着很多在途请求，而别的
+        # 账号是闲的，还死盯着它就等于把并发全压在一个号上 —— 上游按
+        # 「账号 + 分钟」计 token，这一撞就破配额，整池进入下一轮冷却。
+        # 所以这一层在**负载明显更高**时会把普通账号也放进候选，让负载分摊
+        # 生效；负载相同时权重仍然优先（用户设置的意图不被推翻）。
+        weighted = self._pick_weighted_candidates(snapshot, exclude, model)
+        if weighted:
+            # 权重账号当前有多忙？
+            weighted_load = min(self._inflight_of(a) for a, _k, _w in weighted)
+            # 整个池子里最闲的账号有多忙？（只看可服务且未被排除的）
+            pool_load = None
+            for acc in snapshot:
+                if acc.uid in exclude:
+                    continue
+                load = self._inflight_of(acc)
+                if pool_load is None or load < pool_load:
+                    pool_load = load
+            # 权重账号比最闲的账号还忙出一截 ⇒ 让路给闲的（负载分摊优先）。
+            # 负载相同时权重仍然优先 —— 用户设置的意图不被推翻。
+            if pool_load is not None and weighted_load > pool_load:
+                pass          # 不走权重层，落到下面的普通轮询
+            else:
+                account = self._smooth_weighted_pick(weighted, "_manual_weights")
+                if account is not None:
+                    return account
         account = self._pick_expiring_first(snapshot, exclude, model)
         if account is not None:
             return account
@@ -4799,6 +5122,23 @@ class AccountPool(object):
             return account
         return self._rotate_pick(snapshot, exclude, model, cursor_key=page)
 
+    def _pick_weighted_candidates(self, snapshot, exclude, model):
+        """带手动权重的账号候选集（(account, uid, weight) 三元组）。
+
+        与 `_pick_weighted_first` 的区别只在于它返回**集合**而不是选好的账号 ——
+        调用方要拿它跟别的候选比负载。
+        """
+        ready = []
+        for account in snapshot:
+            if account.uid in exclude:
+                continue
+            if int(getattr(account, "weight", 1) or 1) <= 1:
+                continue
+            if not account.ready(model=model, refresh=False):
+                continue
+            ready.append((account, account.uid, int(account.weight)))
+        return ready
+
     def _pick_weighted_first(self, snapshot, exclude, model):
         """手动权重 > 1 的账号优先接单，或 None（没有可交的）。
 
@@ -4808,6 +5148,15 @@ class AccountPool(object):
         分流量，它们与权重 1 的账号之间则是「先用完我再轮别人」。权重 1 的
         账号完全不进这一层：临期积分、剩余用量这些自动子权重照旧在它们身上
         生效，一行都不变。
+
+        **在途感知**：权重是**流量占比**的偏好，不是「独占」的意思。
+        如果一个 weight=5 的账号此刻已经背着 99 个在途请求，而另一个
+        weight=1 的账号是闲的，还死盯着前者就等于把并发全压在一个号上 ——
+        上游按「账号 + 分钟」计 token，这一撞就破配额。
+        所以在途数少的**优先**，权重只在同等负载的账号之间决定份额。
+        换句话说：权重回答「同等条件下先给谁」，在途数回答「现在该给谁」。
+
+        没有注入在途 provider 时每个账号都是 0 ⇒ 只有一组 ⇒ 行为与从前完全一致。
         """
         ready = []
         for account in snapshot:
@@ -4815,7 +5164,7 @@ class AccountPool(object):
                 continue
             if int(getattr(account, "weight", 1) or 1) <= 1:
                 continue
-            if not account.ready(model=model):
+            if not account.ready(model=model, refresh=False):
                 continue
             ready.append((account, account.uid, int(account.weight)))
         if not ready:
@@ -4837,7 +5186,7 @@ class AccountPool(object):
         urgent = [a for a in snapshot if a.in_expiring_window()]
         if not urgent:
             return None
-        ready = [a for a in urgent if a.uid not in exclude and a.ready(model=model)]
+        ready = [a for a in urgent if a.uid not in exclude and a.ready(model=model, refresh=False)]
         if not ready:
             return None
         return self._weighted_pick(ready)
@@ -4880,7 +5229,7 @@ class AccountPool(object):
             weight = table.get((account.uid, model))
             if weight is None or weight <= 1:
                 continue
-            if not account.ready(model=model):
+            if not account.ready(model=model, refresh=False):
                 continue
             ready.append((account, weight))
         if not ready:
@@ -4903,6 +5252,20 @@ class AccountPool(object):
         largest running total wins, and the winner pays back the whole round's
         weight. Equal weights degenerate to a plain rotation, so same-weight
         entries keep taking turns.
+
+        **Inflight-aware**: entries are grouped by their current in-flight
+        count and the **least loaded group** wins; the weighted round-robin
+        then picks within that group. This is what makes the load spreading
+        work at all: without it the group selection happens only in the
+        fallback rotation, so a single account with a manual weight (or one
+        inside the expiring-credits window) would capture every request and
+        the feature would be silently off exactly where the pool converges.
+
+        The grouping never changes *who is eligible* — it only reorders within
+        the eligible set, and the weight still decides the share inside the
+        chosen group. An account with weight 5 that is much busier than a
+        weight-1 account yields to it; two equally busy accounts still split
+        by weight.
 
         `key` is what the rotation state is kept under - a uid for the
         expiring-credits window, a (uid, model) pair for the remaining-usage
@@ -4932,6 +5295,15 @@ class AccountPool(object):
             else:
                 state = dict((key, value) for key, value in stored.items()
                              if key[0] in keep_uids)
+            # 在途分组：先看最闲的那一组，组内再按权重轮转。
+            # 没有注入 provider 时每个账号都是 0 ⇒ 只有一组 ⇒ 与从前完全一致。
+            if self._inflight_provider is not None and len(entries) > 1:
+                loads = {}
+                for account, key, _weight in entries:
+                    loads[key] = self._inflight_of(account)
+                best_load = min(loads.values())
+                entries = [triple for triple in entries
+                           if loads[triple[1]] == best_load]
             total = 0
             chosen = None
             for account, key, weight in entries:
@@ -4996,6 +5368,25 @@ class AccountPool(object):
         The whole-pool rotation keeps the single `_cursor` it always had. A
         page rotation keeps its own cursor per page, so page picks and plain
         picks never move each other's position.
+
+        Inflight awareness: among the accounts that are actually servable, the
+        one carrying the fewest in-flight requests wins; ties fall back to the
+        rotation order the pool always had. This is a **secondary** key — it
+        reorders who is offered, it never changes who is eligible.
+
+        Why it matters: every other preference in this picker (manual weight,
+        expiring credits, remaining usage) is a *static* property of the pool.
+        Static preferences alone make concurrent requests converge on the same
+        account — the pool's own docstring in wb_proxy notes that upstream
+        bills tokens per (account, minute), so two conversations on one account
+        blow past the quota and every request then gets slower, because each
+        switch lands on an account with no prefix cache. Spreading the load by
+        live in-flight count is the preventive half of that; the per-account
+        slot limit is the reactive half.
+
+        Only used when the pool was given an inflight provider (wb_proxy does
+        that at startup). Without it every account counts as 0 and the pick is
+        exactly the plain rotation it always was.
         """
         total = len(group)
         if total == 0:
@@ -5003,19 +5394,130 @@ class AccountPool(object):
         with self._lock:
             start = (self._page_cursors.get(cursor_key, 0) if cursor_key is not None
                      else self._cursor)
+        now = time.time()
+        # 收集可服务账号。**冷却到期时刻要在 ready() 过滤之前记录** ——
+        # 冷却中的账号根本过不了 ready()，如果只在可服务账号上记录，
+        # _recovery_deadlines 永远是空的，半开探测永远不会被触发（死代码）。
+        #
+        # 这正是「冷却到期 → 全员压上」这个问题存在的原因：只有**正在冷却**
+        # 的账号才需要被记住，到期后才知道它刚从冷却里出来。
+        candidates = []
+        recovered = []
         for offset in range(total):
             index = (start + offset) % total
             account = group[index]
             if account.uid in exclude:
                 continue
-            if account.ready(model=model):
+            # 先记冷却到期时刻（不抛异常：throttle_wait 读的是内存里的窗口）
+            try:
+                wait = account.throttle_wait()
+            except Exception:
+                wait = 0.0
+            if wait > 0:
                 with self._lock:
-                    if cursor_key is not None:
-                        self._page_cursors[cursor_key] = (index + 1) % total
-                    else:
-                        self._cursor = (index + 1) % total
-                return account
-        return None
+                    self._recovery_deadlines[account.uid] = now + wait
+            elif self._is_freshly_recovered(account, now, model):
+                # 冷却**刚到期**的账号：它已经不在冷却里了，但还没被证明能用。
+                # 它必须进候选 —— 否则半开探测永远不会被触发（死代码）。
+                recovered.append((index, account))
+                continue
+            if account.ready(model=model, refresh=False):
+                candidates.append((index, account))
+        if not candidates and not recovered:
+            return None
+        # 半开探测：刚从冷却里恢复的账号先让路。
+        #
+        # 语义（与 Coding2API src/engine/half_open.py 一致，但方向要反过来想）：
+        # 半开不是「优先选它」，而是「**它还没被证明能用**」。
+        #   - 有健康账号 ⇒ 用健康的，半开的账号让路；
+        #   - 全是半开的 ⇒ 只放**一个**出去试探，其余的请求改选别的账号
+        #     （一个都没有时只能返回 None，交给上层排队/报错）。
+        #
+        # 为什么不能「只要有半开账号就选它」：那样恢复期内的账号会**独占**所有
+        # 请求 —— 刚解冻的号还没被证明能用，却把所有流量都吃掉了，
+        # 正好是半开探测要避免的那种「压上一个号」。
+        if candidates:
+            # 有健康账号：半开的让路。
+            pass
+        else:
+            # 没有健康账号：半开里只放**一个**出去试探。
+            #
+            # 只能对**选中的那一个**调 half_open_probe —— 它是有副作用的
+            # （会登记「试探进行中」）。对每个候选都调一遍的话，三个候选
+            # 会各拿一个令牌，第二个请求又会把它们全占掉 —— 半开的意义
+            # （只放一个出去）就没了。
+            best_load = None
+            chosen_pair = None
+            for pair in recovered:
+                load = self._inflight_of(pair[1])
+                if best_load is None or load < best_load:
+                    best_load = load
+                    chosen_pair = pair
+            if chosen_pair is None:
+                return None
+            if not chosen_pair[1].half_open_probe(model):
+                # 令牌被别人拿走了（另一个并发请求）—— 本次不派单。
+                return None
+            candidates = [chosen_pair]
+        if self._inflight_provider is not None:
+            best = min(candidates, key=lambda pair: self._inflight_of(pair[1]))
+        else:
+            best = candidates[0]
+        index = best[0]
+        with self._lock:
+            if cursor_key is not None:
+                self._page_cursors[cursor_key] = (index + 1) % total
+            else:
+                self._cursor = (index + 1) % total
+        return best[1]
+
+    def _is_freshly_recovered(self, account, now, model=None):
+        """这个账号是不是刚从冷却里恢复（⇒ 需要半开试探）。
+
+        判据：它**曾经**有过一个冷却窗口，而那个窗口现在已经到期。
+
+        实现：冷却期间记下「它要到什么时候才恢复」（uid -> epoch）。
+        之后再看它时：
+          - 还在冷却 ⇒ 刷新这个到期时刻（窗口被延长了也算）；
+          - 不在冷却、且记下的到期时刻已经过去 ⇒ 刚恢复，需要半开试探；
+          - 从来没冷却过 ⇒ 不是半开情形。
+
+        注意「刚」不严格：到期后过了多久都算半开一次。这是刻意的 ——
+        半开的作用是「冷却到期后的第一批请求只放一个出去」，而不是精确计时；
+        试探成功后的 TTL 才决定多久之内不再试探。
+
+        试探成功后（账号的半开状态里记着「已恢复」）这个账号**不再是半开候选** ——
+        它已经被证明能用了，不该继续让路。判定放在这里而不是让 note_success
+        回头通知池子，是为了避免 Account 反向依赖 AccountPool。
+
+        `model` 必须传真实的模型名：半开状态按 (uid, 模型) 分开，
+        用 model=None 去查一个按真实模型名写下的标记永远查不到。
+        """
+        try:
+            wait = account.throttle_wait()
+        except Exception:
+            return False
+        if account.half_open_is_recovered(model):
+            # 试探已经成功过：这个账号被证明能用，不再是半开候选。
+            with self._lock:
+                self._recovery_deadlines.pop(account.uid, None)
+            return False
+        with self._lock:
+            deadline = self._recovery_deadlines.get(account.uid)
+            if wait > 0:
+                # 还在冷却：记下它要到什么时候才恢复。
+                self._recovery_deadlines[account.uid] = now + wait
+                return False
+            if deadline is None:
+                # 从来没被冷却过：不是半开情形。
+                return False
+            if now < deadline:
+                # 到期时刻还没到，但冷却已经不在了 —— 说明窗口被提前清掉了
+                # （clear_error 之类）。这也算恢复，重新记一个到期时刻。
+                self._recovery_deadlines[account.uid] = now
+                return True
+            # 到期时刻已过 ⇒ 刚恢复。
+            return True
 
     def representative(self, realm=None):
         with self._lock:

@@ -28,6 +28,17 @@ STATUS_NAME = "status.json"
 MANIFEST_NAME = "release-manifest.json"
 HELPER_NAME = "wb_update_apply.py"
 BACKUP_PREFIX = "backup-"
+
+#: 更新包的体积限制（与 systemd 更新器一致：ops/aliyun/…-updater.py:54-58）。
+#:
+#: 之前只有 systemd 那条路径有这些限制，便携路径没有 ——
+#: 而便携路径跑在网关自己的权限下（Docker 部署里是 root），
+#: 一个无限大的下载或一个几百 KB 的 zip bomb 就足以把磁盘写满。
+#: ARCHIVE_LIMIT 挡下载体积，UNPACKED_LIMIT 挡解压后的总量，
+#: FILE_LIMIT 挡文件数量。
+ARCHIVE_LIMIT = 128 * 1024 * 1024
+UNPACKED_LIMIT = 256 * 1024 * 1024
+FILE_LIMIT = 1200
 #: Transient copy of the live app layer taken while a rollback is in flight.
 #: It is not a retained backup (it is removed once the rollback succeeds); it
 #: exists so a rollback that ends in a gateway that will not start can be undone
@@ -143,18 +154,48 @@ def sha256_file(path):
 
 
 def download(url, dest, timeout=60):
+    """下载一个更新资产，带**体积上限**。
+
+    上限不是可有可无的：便携更新器跑在网关自己的权限下（Docker 部署里是
+    root），一个无限大的下载就是「把磁盘写满」。systemd 那条更新路径早就
+    有 ARCHIVE_LIMIT 了（ops/aliyun/workbuddy2api-hub-updater.py:56），
+    这条路径当时漏了。
+    """
     req = urllib.request.Request(url, headers={"User-Agent": "wb-proxy-updater"})
+    written = 0
     with urllib.request.urlopen(req, timeout=timeout) as src:
         with open(dest, "wb") as out:
-            shutil.copyfileobj(src, out)
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > ARCHIVE_LIMIT:
+                    raise UpdateError("更新包下载超过体积限制 (%d 字节)"
+                                      % ARCHIVE_LIMIT)
+                out.write(chunk)
     return dest
 
 
 def safe_extract(zip_path, dest, root_name):
-    """Extract only the manifest and `<root_name>/...`; reject traversal."""
+    """Extract only the manifest and `<root_name>/...`; reject traversal.
+
+    三道限制（与 systemd 更新器对齐，ops/aliyun/…-updater.py:54-58）：
+      - 文件数上限 —— 挡住「几万个空文件」这种包；
+      - 单文件大小上限；
+      - 解压总量上限 —— **这才是 zip bomb 的正解**：
+        一个几百 KB 的 zip 可以解压出几十 GB，限单文件挡不住它。
+
+    没有这些限制时，一个精心构造的更新包能把磁盘写满 —— 而这条路径跑在
+    网关自己的权限下（Docker 部署里是 root）。
+    """
     os.makedirs(dest, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        if len(infos) > FILE_LIMIT:
+            raise UpdateError("更新包文件数量超过限制")
+        total_size = 0
+        for info in infos:
             name = info.filename
             if name.endswith("/"):
                 continue
@@ -167,6 +208,11 @@ def safe_extract(zip_path, dest, root_name):
                 continue
             if (info.external_attr >> 16) & 0o170000 == 0o120000:
                 raise UpdateError("更新包包含符号链接: %s" % name)
+            if info.file_size > UNPACKED_LIMIT:
+                raise UpdateError("更新包单文件超过大小限制")
+            total_size += info.file_size
+            if total_size > UNPACKED_LIMIT:
+                raise UpdateError("更新包解压总量超过限制")
             target = os.path.join(dest, *norm.split("/"))
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with zf.open(info) as src, open(target, "wb") as out:

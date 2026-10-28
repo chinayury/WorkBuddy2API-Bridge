@@ -84,6 +84,10 @@ wb_window_probe.py
 
 # v0.1.0 的发布文档与版本标识：随包走，升级时一并替换，
 # 保证「包里带的说明」与「包里跑的代码」始终是同一版。
+#
+# 正式版（0.1.0）的那套文档以 -formal 结尾，是**当前版本**的说明；
+# 不带 -formal 的同名文件是 v0.1.0 基线时期的历史归档，内容描述的是当时的代码。
+# 两套都带上：前者是随包运行的版本说明，后者是历史沿革。
 VERSION
 docs/README-v0.1.0.md
 docs/DEPLOY-v0.1.0.md
@@ -91,3 +95,10 @@ docs/USAGE-v0.1.0.md
 docs/BUGFIXES-v0.1.0.md
 docs/CHANGELOG-v0.1.0.md
 docs/SECURITY-v0.1.0.md
+docs/README-v0.1.0-formal.md
+docs/DEPLOY-v0.1.0-formal.md
+docs/USAGE-v0.1.0-formal.md
+docs/BUGFIXES-v0.1.0-formal.md
+docs/CHANGELOG-v0.1.0-formal.md
+docs/SECURITY-v0.1.0-formal.md
+docs/ARCHITECTURE-v0.1.0.md

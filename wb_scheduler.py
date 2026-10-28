@@ -547,7 +547,12 @@ class Scheduler:
                         # 排在夜猫子之后: 夜猫子有 23:00-08:00 计数窗口, 先让它跑。
                         # 此前这条链路只有面板的「一键做任务」按钮能触发, 没人点就
                         # 每天白丢几百积分 (实测单账号 500 分)。
-                        growth = wb_tasks.run_growth_tasks(acc, gap=1.0, claim=True)
+                        #
+                        # skip_night=True: 夜猫子由上面那条 run_night_growth 独占。
+                        # 两条路都跑的话, _progress_one 会看到「现在是夜间窗口」
+                        # 而再补报 tgt-cur 次 —— 一晚上 3~4 次, 而上游契约是每天 1 次。
+                        growth = wb_tasks.run_growth_tasks(acc, gap=1.0, claim=True,
+                                                           skip_night=True)
                         earned = growth.get("earned_credit") or 0
                         growth_count += 1
                         growth_credit += earned

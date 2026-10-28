@@ -543,9 +543,17 @@ def _proxy_header_ip(value):
 def login_rate_limit_key(peer_ip, headers):
     """限流键：对端可信时取代理头里的真实客户端 IP，否则取对端地址。
 
-    X-Real-IP 优先（nginx 里放的就是真实来源），其次 X-Forwarded-For 的
-    第一个（链上最左是最初的客户端）。头不可用就退回对端地址：宁可让经
-    反代的客户端共用一个桶（退化为旧行为），也不能拿解析不出来的串当键。
+    X-Real-IP 优先（nginx 里放的就是真实来源）。
+
+    X-Forwarded-For 取**最右边**的一段，不是最左边。
+    原因：nginx 的 `$proxy_add_x_forwarded_for` 是**追加** —— 客户端自己带的
+    `X-Forwarded-For: 1.2.3.4` 会原样留在最左，代理把真实来源追加到最右。
+    取最左等于**让客户端自己选限流桶**：每次登录请求换一个伪造 IP，
+    5 次/60 秒的上限形同虚设。取最右才是代理追加的那一段。
+    （如果部署的是会**替换**整个头的代理，最右也是真实来源 —— 两种都成立。）
+
+    头不可用就退回对端地址：宁可让经反代的客户端共用一个桶（退化为旧行为），
+    也不能拿解析不出来的串当键。
     """
     if not peer_is_trusted(peer_ip):
         return peer_ip
@@ -553,10 +561,12 @@ def login_rate_limit_key(peer_ip, headers):
     if real:
         return real
     forwarded = (headers.get("X-Forwarded-For") if headers else None) or ""
-    first = forwarded.split(",")[0]
-    via_chain = _proxy_header_ip(first)
-    if via_chain:
-        return via_chain
+    parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+    # 从右往左找第一个能解析成 IP 的段 —— 那是离本机最近的可信跳点。
+    for part in reversed(parts):
+        via_chain = _proxy_header_ip(part)
+        if via_chain:
+            return via_chain
     return peer_ip
 _models_cache = {"intl": {"at": 0.0, "data": None}, "cn": {"at": 0.0, "data": None}}
 #: 目录来源追踪（面板展示用）：每个 realm 最近一次构建/刷新清单的出处。
@@ -591,9 +601,19 @@ def configured_keys():
         log("could not read api keys: %s" % exc)
         return []
 def auth_required():
-    """Whether /v1 calls must present a key at all."""
+    """Whether /v1 calls must present a key at all.
+
+    Fail closed when settings.json exists but cannot be read: the key list
+    would come back empty, and "no keys configured" is exactly the state that
+    turns the gateway off for anybody who can reach the port. An unreadable
+    settings file means we do NOT know whether keys are configured — so we
+    must require one.
+    """
     if wb_settings.auth_disabled(ACCOUNTS_DIR):
         return False
+    if wb_settings.settings_unreadable(ACCOUNTS_DIR):
+        # 读不出来 ≠ 没有配置。要求鉴权。
+        return True
     if any(entry.get("enabled") for entry in configured_keys()):
         return True
     return bool(API_KEY)
@@ -981,6 +1001,16 @@ def _persist_usage(row, fail_label):
         os.makedirs(USAGE_DIR, exist_ok=True)
         with open(USAGE_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # usage.jsonl 里可能有上游错误正文，而上游的 401/403 正文**会回显授权头**
+        # （wb_activity.safe_message 的注释里写的就是这件事）。
+        # 这个文件同机任何用户都读得到，所以权限必须收紧到 0600 ——
+        # 与凭据文件（accounts/*.json）同一把锁。
+        try:
+            if os.name != "nt":
+                os.chmod(USAGE_LOG, 0o600)
+                os.chmod(USAGE_DIR, 0o700)
+        except OSError:
+            pass
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
@@ -1014,7 +1044,11 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
         "error": True,
         "outcome": outcome,
         "status": status,
-        "message": str(message)[:200],
+        # 上游错误正文是**自由文本**，而 401/403 的正文里回显授权头是常见现象
+        # （wb_activity.safe_message 的注释写的就是这件事）。这一行会原样落进
+        # usage/usage.jsonl —— 那个文件同机任何用户都可能读得到。
+        # 所以落盘前按已知凭证形态打码：落盘的只该是一句人能读的原因。
+        "message": wb_activity.safe_message(message)[:200],
         "elapsed_ms": elapsed_ms,
     }
     if stream is not None:
@@ -1037,7 +1071,10 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     # 行一直没打出来——出错时最想知道的「哪个账号、什么终态」反而要回去翻
     # usage.jsonl，而 chat done 那条早就有 acct= 了，两侧不对称。
     acc_tag = f" acct={account[:8]}" if account else ""
-    log(f"request error: model={model}{dur}{acc_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
+    # 日志这一行同样要脱敏：上游 401/403 的正文会回显授权头，
+    # 原样打进日志就等于把 bearer token 写进了日志文件与面板的运行日志页。
+    log(f"request error: model={model}{dur}{acc_tag} status={status} "
+        f"outcome={outcome} msg={wb_activity.safe_message(message)[:180]}",
         level="ERROR", tag="chat")
     return row
 def _pct(values, q):
@@ -10279,7 +10316,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "0.1.7",
+        "version": "0.1.0",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -14264,6 +14301,45 @@ _SWITCH_LOG = {}
 _ACCOUNT_INFLIGHT = {}
 _ACCOUNT_INFLIGHT_LOCK = threading.Lock()
 
+#: 实时在途计数（与上面的名额上限**无关**，永远打开）。
+#:
+#: 名额上限默认是 0（不限），那条路径不记账 —— 于是默认配置下池子看不到任何
+#: 负载信号，所有偏好都是静态的，并发请求会自发收敛到同一个账号上。上游按
+#: 「账号 + 分钟」计 token，两个会话落在同一账号上很容易冲破配额然后 429，
+#: 换号之后又因为丢了前缀缓存而更慢（TTFT 1.5s → 5~6s）。
+#:
+#: 这个计数器只做一件事：让选号知道「现在谁在忙」。它不参与限流判定，
+#: 不影响任何请求的成败，只影响**给谁**。
+_ACCOUNT_LOAD = {}
+_ACCOUNT_LOAD_LOCK = threading.Lock()
+
+
+def account_load_acquire(uid):
+    """记一次在途请求。返回 False 表示 uid 不可用（不该发生）。"""
+    if not uid:
+        return False
+    with _ACCOUNT_LOAD_LOCK:
+        _ACCOUNT_LOAD[uid] = _ACCOUNT_LOAD.get(uid, 0) + 1
+    return True
+
+
+def account_load_release(uid):
+    """归还一次在途请求。与 acquire 配对。"""
+    if not uid:
+        return
+    with _ACCOUNT_LOAD_LOCK:
+        current = _ACCOUNT_LOAD.get(uid, 0)
+        if current <= 1:
+            _ACCOUNT_LOAD.pop(uid, None)
+        else:
+            _ACCOUNT_LOAD[uid] = current - 1
+
+
+def account_load_count(uid):
+    """某账号当前的在途请求数；账号池用它做次级排序键。"""
+    with _ACCOUNT_LOAD_LOCK:
+        return _ACCOUNT_LOAD.get(uid, 0)
+
 
 def account_slot_acquire(account, limit=None):
     """给这个账号占一个在飞名额。回传 True 表示占到了。
@@ -14296,19 +14372,33 @@ def account_slot_release(account):
             _ACCOUNT_INFLIGHT[account.uid] = current - 1
 
 
-def bind_account_slot_to_response(response, account):
+def bind_account_slot_to_response(response, account, on_release=None):
     """把在飞名额绑到响应对象的生命周期上。
 
     名额必须一直占到「上游 body 读完/关掉」为止，而不是占到「拿到响应头」——
     流式回复拿到头之后还要读几十秒，那段时间上游仍算这个账号在跑。响应对象的
     close() 是唯一必然发生的终点（`with upstream:`、显式 close、客户端中断都走
     它），所以把归还挂在 close 上，并加一次性保护防重复扣减。
+
+    `on_release` 是额外的一次性回调：负载计数（_ACCOUNT_LOAD）的终点与名额
+    完全一致（都在上游 body 读完时结束），所以复用同一个 close 钩子最省事，
+    也就不会出现「名额还了、负载没还」的错配。
     """
     if account is None:
+        if on_release is not None:
+            try:
+                on_release()
+            except Exception:
+                pass
         return
     if response is None:
         # 没有响应对象可挂：没有终点可等，立刻归还，否则这个名额会永久泄漏。
         account_slot_release(account)
+        if on_release is not None:
+            try:
+                on_release()
+            except Exception:
+                pass
         return
     released = [False]
 
@@ -14317,6 +14407,12 @@ def bind_account_slot_to_response(response, account):
             return
         released[0] = True
         account_slot_release(account)
+        if on_release is not None:
+            try:
+                on_release()
+            except Exception:
+                # 归还失败不能影响响应关闭这条主路径。
+                pass
 
     try:
         original_close = response.close
@@ -14341,6 +14437,20 @@ def account_inflight_snapshot():
     """{uid: 在飞数}，面板与测试用。"""
     with _ACCOUNT_INFLIGHT_LOCK:
         return dict(_ACCOUNT_INFLIGHT)
+
+
+def account_inflight_count(uid):
+    """单个账号当前的在飞请求数；账号池用它做次级排序键。
+
+    这与「每账号并发上限」开关是**两件事**：上限关着（默认 0 = 不限）时，
+    上面的计数器根本不记账，本函数恒返回 0 —— 但池子仍然可以用它来分摊负载。
+    所以这里不能复用 `account_slot_acquire` 的记账路径，而是单独维护一个
+    永远打开的计数器：它在请求开始时 +1、结束时 -1，与上限开关无关。
+
+    上游按「账号 + 分钟」计 token，两个会话落在同一账号上很容易过百万 token
+    然后 429；分摊在途请求是这件事的**预防**侧（每账号名额是反应侧）。
+    """
+    return account_load_count(uid)
 
 
 #: 出口级退避在单次请求里最多睡这么久（见 wb_egress）：退避阶梯可以到十几秒，
@@ -14622,6 +14732,16 @@ def exc_detail(exc, limit=180):
 SOFT_LIMIT_MARKERS = ("usage exceeds frequency limit", "too many requests",
                       "请求过于频繁")
 SOFT_LIMIT_CODES = (14003,)     # intl, observed on a real 429
+
+#: 上游给的恢复时刻最多信到多久（秒）。
+#:
+#: 上游正文里的重置墙钟是**上游的事实**，但它可能是「下个月」「明年」这种
+#: 荒唐值（配额月结、时区写错、上游自己算错）。照单全收意味着账号被停放一个月，
+#: 等于它从池子里静默消失 —— 面板只显示「无可用账号」，没人知道它去了哪。
+#:
+#: 24 小时是本地上限：真正的配额窗口都是分钟到小时级（6004 写的是分钟、
+#: 14003 是秒级）；超过一天的恢复时刻不可信，到点再试一次比停一个月更划算。
+RATE_LIMIT_RESET_MAX_WAIT = 24 * 3600.0
 
 # Wording that scopes a 429 to the credential itself. These are matched as whole
 # words or explicit phrases, never as bare substrings: a 429 body carries
@@ -15326,6 +15446,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             account.note_unknown_failure(message)
         else:
             account.note_failure(message)
+        # 半开试探失败：结束这个 (账号, 模型) 的半开，把机会让给下一个请求。
+        # （成功路径由 account.note_success 结算，见 wb_accounts.half_open_settled。）
+        try:
+            account.half_open_settled(False, model=model)
+        except Exception:
+            pass
         return True
 
     last_error = None
@@ -15379,6 +15505,19 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # 当前这一轮已经占住、但还没交给调用方的账号名额。任何失败路径都要归还
     # （循环开头统一处理），成功路径把它绑到响应对象上后置空。
     slot_held = None
+    # 实时在途计数（与名额上限无关，永远打开）：账号池用它把并发请求分摊到
+    # 不同账号上。它与 slot_held 同步增减，但**生命周期更长** —— slot_held 在
+    # 响应交给调用方时就结束（在途 = 上游还在处理），而负载计数要一直算到
+    # 上游 body 读完/关闭（那段时间上游仍在算这个账号在跑）。两者的终点
+    # 不同，所以这里单独记一个 load_held，在响应 close 时归还。
+    load_held = None
+
+    def _release_load(account):
+        """归还负载计数（可重复调用，靠 load_held 置空保证只还一次）。"""
+        nonlocal load_held
+        if load_held is not None:
+            account_load_release(load_held.uid)
+            load_held = None
     def pick_account():
         """按当前 exclude/busy 选一个账号，并占住它的在飞名额。
 
@@ -15412,6 +15551,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         if slot_held is not None:
             account_slot_release(slot_held)
             slot_held = None
+            _release_load(None)
         if pinned is not None:
             account = pinned if pinned.uid not in tried else None
             # 固定账号（/u/<ref>/ 路由、流式中断后的原地重连）也要占名额，
@@ -15456,74 +15596,139 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             if session_key and POOL: POOL.affinity.demote(session_key, account.uid)
             account_slot_release(account)
             continue
+        # 被选中的账号若令牌快到期了，在这里刷新一次。
+        #
+        # 为什么刷新放在**选中之后**而不是选号时：选号要扫过整个账号池，
+        # 而 ready() 带刷新副作用时，一次派发会对每个临期账号各发一次网络
+        # 请求（19 个账号 = 19 次串行刷新，每次最长 30 秒）—— 派发路径上
+        # 等网络是不能接受的。改成选号只看「能不能用」（refresh=False），
+        # 刷新只由**真正要用**的那个账号付。
+        #
+        # 刷新失败（凭据真的不行）就跳过这个号继续轮转 —— 与 401 的处理一致。
+        if account.token_needs_refresh():
+            try:
+                if not account.refresh():
+                    log("account %s: token refresh before use failed; rotating"
+                        % account.uid[:8])
+                    account_slot_release(account)
+                    continue
+            except Exception as refresh_exc:
+                log("account %s: token refresh before use raised: %s"
+                    % (account.uid[:8], exc_detail(refresh_exc, 160)))
+                account_slot_release(account)
+                continue
         tried.add(account.uid)
         last_uid = account.uid
         slot_held = account
+        # 负载计数与这一轮的账号绑定。上一轮若有未归还的（失败路径）先还掉，
+        # 再记这一个 —— 失败路径在循环开头统一处理，这里只防重复计数。
+        _release_load(None)
+        account_load_acquire(account.uid)
+        load_held = account
         cfg = wb_accounts.get_realm_config(account.realm)
         chat_url = account.chat_base_url() + CHAT_PATH
-        # The cache key is account scoped, so it is rebuilt per candidate rather
-        # than once up front. Opt-in only: measurement showed the upstream
-        # caches prefixes without it (see prompt_cache_key_enabled).
-        if prompt_cache_key_enabled():
-            attempt_body = inject_prompt_cache_key(upstream_body, account.uid, session_key)
-        else:
-            attempt_body = upstream_body
-        # 官方 CLI 的 chat 请求体（见 wb_identity）：gzip（RequestBodyGzip=true，
-        # 带 Content-Encoding: gzip）+ 注入 cache_retention=long；Responses API
-        # 的字段 / 客户端 metadata 不带。VSCode 官方主 chat 也默认 gzip
-        # （RequestBodyGzip=true → executeByMode → createCustomFetch 压缩）。
-        cli_identity = account.is_cli_identity()
-        vscode_identity = account.product == wb_identity.PRODUCT_VSCODE
-        if cli_identity:
-            attempt_body = {k: v for k, v in attempt_body.items()
-                            if k not in wb_identity.CLI_BODY_DROP_FIELDS}
-            attempt_body["cache_retention"] = wb_identity.CLI_CACHE_RETENTION
-        # 紧凑 JSON：官方客户端（Node JSON.stringify）不带分隔符后的空格，默认的
-        # json.dumps(separators=(", ", ": ")) 会让 body 字节与 Content-Length 都成
-        # 一处机器特征。上游解析等价，只影响线上字节。
-        attempt_data = encode_upstream_body(attempt_body)
-        if cli_identity or vscode_identity:
-            attempt_data = wb_identity.gzip_body(attempt_data)
-        # 会话头族（X-Conversation-ID / -Request-ID）的语义见 wb_identity：桌面端
-        # 官方客户端同一会话复用同一个 id：桌面端 / CLI 按 (账号, 会话键) 稳定
-        # 派生（#448），客户端没给会话键时保持每请求新生成；VSCode 按官方
-        # BaseAgent 的 32hex 形态每请求新生成，并带 X-Model-ID。
-        # 缺了这套头上游的渠道校验会回 400 / code 11-128（conversation id
-        # missing）。跨账号重试时按账号各自派生，不会把两个号串到同一个会话上。
-        # 重试换号时 session_key / turn_request_id / vscode_conversation_id 都不变。
-        if account.product == wb_identity.PRODUCT_VSCODE:
-            conv_id = vscode_conversation_id
-        elif session_key:
-            conv_id = wb_identity.conversation_id_for(account.uid, session_key)
-        else:
-            conv_id = None
-        req_headers = account.headers(
-            purpose="chat", session_key=session_key,
-            turn_request_id=turn_request_id, model=model,
-            conversation_id=conv_id)
-        if cli_identity or vscode_identity:
-            req_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
-        req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
-                                     headers=req_headers)
-        req.wb_exact_headers = list(req_headers.items())
+        # 从这里到发出请求的这段构造（缓存键注入 → 压缩 → 造头 → 建 Request）
+        # **必须在 try 之内**。
+        #
+        # 旧实现里这段在 try 之外，于是其中任何一个函数抛异常（磁盘满时
+        # inject_prompt_cache_key 读文件失败、gzip 失败、account.headers() 失败…）
+        # 都会直接冲出 open_upstream —— 循环外那段统一归还根本走不到，
+        # 名额与负载计数**双双泄漏**。泄漏的名额有上限可见，泄漏的负载计数没有：
+        # 那个账号的「忙」值永久虚高 ⇒ 被选号永久排到最后 ⇒ 被静默踢出池子。
+        try:
+            # The cache key is account scoped, so it is rebuilt per candidate rather
+            # than once up front. Opt-in only: measurement showed the upstream
+            # caches prefixes without it (see prompt_cache_key_enabled).
+            if prompt_cache_key_enabled():
+                attempt_body = inject_prompt_cache_key(upstream_body, account.uid, session_key)
+            else:
+                attempt_body = upstream_body
+            # 官方 CLI 的 chat 请求体（见 wb_identity）：gzip（RequestBodyGzip=true，
+            # 带 Content-Encoding: gzip）+ 注入 cache_retention=long；Responses API
+            # 的字段 / 客户端 metadata 不带。VSCode 官方主 chat 也默认 gzip
+            # （RequestBodyGzip=true → executeByMode → createCustomFetch 压缩）。
+            cli_identity = account.is_cli_identity()
+            vscode_identity = account.product == wb_identity.PRODUCT_VSCODE
+            if cli_identity:
+                attempt_body = {k: v for k, v in attempt_body.items()
+                                if k not in wb_identity.CLI_BODY_DROP_FIELDS}
+                attempt_body["cache_retention"] = wb_identity.CLI_CACHE_RETENTION
+            # 紧凑 JSON：官方客户端（Node JSON.stringify）不带分隔符后的空格，默认的
+            # json.dumps(separators=(", ", ": ")) 会让 body 字节与 Content-Length 都成
+            # 一处机器特征。上游解析等价，只影响线上字节。
+            attempt_data = encode_upstream_body(attempt_body)
+            if cli_identity or vscode_identity:
+                attempt_data = wb_identity.gzip_body(attempt_data)
+            # 会话头族（X-Conversation-ID / -Request-ID）的语义见 wb_identity：桌面端
+            # 官方客户端同一会话复用同一个 id：桌面端 / CLI 按 (账号, 会话键) 稳定
+            # 派生（#448），客户端没给会话键时保持每请求新生成；VSCode 按官方
+            # BaseAgent 的 32hex 形态每请求新生成，并带 X-Model-ID。
+            # 缺了这套头上游的渠道校验会回 400 / code 11-128（conversation id
+            # missing）。跨账号重试时按账号各自派生，不会把两个号串到同一个会话上。
+            # 重试换号时 session_key / turn_request_id / vscode_conversation_id 都不变。
+            if account.product == wb_identity.PRODUCT_VSCODE:
+                conv_id = vscode_conversation_id
+            elif session_key:
+                conv_id = wb_identity.conversation_id_for(account.uid, session_key)
+            else:
+                conv_id = None
+            req_headers = account.headers(
+                purpose="chat", session_key=session_key,
+                turn_request_id=turn_request_id, model=model,
+                conversation_id=conv_id)
+            if cli_identity or vscode_identity:
+                req_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
+            req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
+                                         headers=req_headers)
+            req.wb_exact_headers = list(req_headers.items())
+        except Exception as exc:
+            # 构造请求失败：这一轮还没发出去，但名额与负载已经占上了 —— 必须还。
+            log("account %s: building the upstream request failed: %s"
+                % (account.uid[:8], exc_detail(exc, 200)))
+            if slot_held is not None:
+                account_slot_release(slot_held)
+                slot_held = None
+            _release_load(None)
+            last_error = exc
+            continue
         try:
             resp = wb_accounts.urlopen(req, timeout=header_timeout,
                                        proxy=account.proxy)
             _apply_stream_idle_timeout(resp, idle_timeout)
-            account.note_success(model=model)
-            if egress_backoff and not defer_egress_success:
-                # This outbound path just served a request, so its transient
-                # streak is over (same rule as the account's note_success).
-                # Callers that read the body afterwards defer this to the end
-                # of the read: a stream that dies mid-body is not a success.
-                wb_egress.note_success(
-                    wb_upstream_pool.egress_key(chat_url, account.proxy))
-            reset_switch_counter(account, model)
+            # 从这里到把响应交出去，中间任何一个调用抛异常都会让 resp 泄漏
+            # （开了 keep-alive 连接池时，泄漏的是一条复用的 TCP/TLS 连接 ——
+            # 慢性的socket 泄漏，直到池被耗尽才显形）。
+            # 所以这段整体包起来：异常时把 resp 关掉再抛。
+            try:
+                account.note_success(model=model)
+                if egress_backoff and not defer_egress_success:
+                    # This outbound path just served a request, so its transient
+                    # streak is over (same rule as the account's note_success).
+                    # Callers that read the body afterwards defer this to the end
+                    # of the read: a stream that dies mid-body is not a success.
+                    wb_egress.note_success(
+                        wb_upstream_pool.egress_key(chat_url, account.proxy))
+                reset_switch_counter(account, model)
+            except Exception:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                raise
             # 名额交给响应对象：它一直占到上游 body 读完/关掉为止（流式回复拿到
             # 头之后还要读几十秒，那段时间上游仍算这个账号在跑）。绑定后本地
             # 标记置空，循环开头就不会再重复归还。
-            bind_account_slot_to_response(resp, account)
+            #
+            # 负载计数也交给同一个 close 钩子归还，但**闭包必须抓住账号本身**，
+            # 不能去读那个随后会被置空的 load_held —— 否则回调执行时 load_held
+            # 已是 None，归还变成空操作，计数只增不减：那个账号的「忙」值永久
+            # 虚高，会被选号永久排到最后（等于被静默踢出池子）。
+            _load_account = account
+            bind_account_slot_to_response(
+                resp, account,
+                on_release=lambda: account_load_release(_load_account.uid))
             slot_held = None
+            load_held = None
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
             # model and the request, and the callers record it on the usage row.
@@ -15559,7 +15764,18 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 # model and grows on the short ladder (60s up to 10m) instead of
                 # the credential's 600s -> 2h one. An unrecognised body gets the
                 # same 60s on one model, with no streak at all.
+                #
+                # 上游给的恢复时刻要**双侧夹取**（借鉴 Coding2API
+                # src/engine/scheduler.py:129-152）：
+                #   - 下界：上游时刻可能已经过去（时钟偏移、上游写了刚过去的时刻）。
+                #     不夹的话算出来的等待是 0 或负数，账号**立刻**重新上线，
+                #     然后立刻再撞 —— 冷却等于没设。
+                #   - 上界：上游说「下个月恢复」时不能真的停一个月。
+                #     账号停太久等于静默从池子里消失，而面板只显示「无可用账号」。
                 wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
+                if reset_at is not None:
+                    wait = min(wait, RATE_LIMIT_RESET_MAX_WAIT)
+                    reset_at = time.time() + wait
                 if reset_at is None and rate_limit_is_soft_shape(detail):
                     wait = account.note_unscoped_rate(model)
                     log("account %s: unscoped 429, parking '%s' for %.0fs "
@@ -15674,6 +15890,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             if exc.code == 401:
                 if session_key and POOL:
                     POOL.affinity.demote(session_key, account.uid)
+                refreshed_ok = False
                 if account.uid not in refreshed:
                     refreshed.add(account.uid)
                     try:
@@ -15689,10 +15906,34 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                         refresh_uid = account.uid
                         last_error = exc
                         continue
-                log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
+                # 刷新没能救回来：这次 401 该怎么定性？
+                #
+                # 判据是**凭据是否真的被上游判失效**，而不是「收到了 401」这件事本身：
+                #   - refresh() 把 token_expired 置起来了（上游明确拒绝了这个凭据，
+                #     或者刷新端点说没这个 refresh token）⇒ 凭据真的不行了，冷却它；
+                #   - 刷新只是因为网络/上游抖动没成（refresh failed），凭据状态未知 ⇒
+                #     不能判它死刑。
+                #
+                # 旧实现对这两种一视同仁地冷却 60 秒。误伤的代价很实：救火的时候
+                # 一次上游抖动就摘掉一批号，池子容量骤降 —— 这正是 2026-10-26 晚
+                # 那次连坐事故里「停用正常账号」那一段的成因。
+                #
+                # 借鉴：Coding2API 的 ErrKind 体系（src/provider/base.py:30-71）把
+                # 「凭据被拒」与「无法判定」严格分开；我们这里落成同一个原则。
+                credential_dead = bool(getattr(account, "token_expired", False))
+                penalty = (wb_accounts.ERR_CREDENTIAL if credential_dead
+                           else wb_accounts.ERR_TRANSIENT)
+                if credential_dead:
+                    log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
+                else:
+                    # 凭据状态未知：不冷却，只记录，让它继续留在池里。
+                    log("account %s: HTTP 401 and the refresh did not conclude "
+                        "(credential state unknown); not cooling the account"
+                        % account.uid[:8])
                 account.note_error("HTTP 401",
                                    cooldown=60,
-                                   single_account=(total <= 1))
+                                   single_account=(total <= 1),
+                                   penalty=penalty)
                 last_error = exc
                 continue
             if exc.code == 400:
@@ -15707,6 +15948,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 if slot_held is not None:
                     account_slot_release(slot_held)
                     slot_held = None
+                    _release_load(None)
                 raise
             if exc.code >= 500:
                 detail = http_error_detail(exc)
@@ -15751,6 +15993,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             if slot_held is not None:
                 account_slot_release(slot_held)
                 slot_held = None
+                _release_load(None)
             raise
         except Exception as exc:
             if wb_accounts.is_tls_verify_error(exc):
@@ -15812,6 +16055,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     if slot_held is not None:
         account_slot_release(slot_held)
         slot_held = None
+        _release_load(None)
     # Only spend credits after every enabled, credential-bearing account in
     # this realm has a persisted upstream 6004 cap for this free model. The
     # switch is opt-in because the retry can incur real charges.
@@ -16134,7 +16378,10 @@ def probe_account(account, model=None, timeout=30):
         if looks_like_local_network(exc):
             row["network"] = True
             row["error"] = "本机网络不可用：%s" % exc_detail(exc)
-            account.note_error(row["error"], cooldown=0)
+            # 本机网络不可用：上游一个字节都没收到，账号完全无辜 —— 显式分类，
+            # 不再靠 cooldown=0 这个隐式约定（见 note_error 的 penalty 参数）。
+            account.note_error(row["error"], cooldown=0,
+                               penalty=wb_accounts.ERR_LOCAL_NETWORK)
             return row
         # The label keeps its 80-char cut; `detail` rides along untouched so the
         # panel can show the whole upstream body on hover.
@@ -16165,8 +16412,12 @@ def probe_account(account, model=None, timeout=30):
                                        rate_limit_code(detail) or "soft-limit"),
                     level="INFO", tag="accounts")
             row["verified"] = True
+        # 分类后再决定要不要冷却这个账号：429 是额度/频率维度（账号没坏），
+        # 400 是请求本身的问题（账号更没坏），只有凭据类的失败才该冷却。
         account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
-                           cooldown=60, detail=detail)
+                           cooldown=60, detail=detail,
+                           penalty=wb_accounts.classify_upstream_error(
+                               status=exc.code, detail=detail))
         row["fails"] = int(account.fails)
         return row
     except Exception as exc:
@@ -16179,12 +16430,14 @@ def probe_account(account, model=None, timeout=30):
             # 否则网络一恢复，池子里全是刚才这轮测试留下的冷却账号。
             row["network"] = True
             row["error"] = "本机网络不可用：%s" % exc_detail(exc)
-            account.note_error(row["error"], cooldown=0)
+            account.note_error(row["error"], cooldown=0,
+                               penalty=wb_accounts.ERR_LOCAL_NETWORK)
             return row
         row["error"] = "%s: %s" % (type(exc).__name__, exc)
         # 测试是诊断动作：失败要看得见（last_error），但不停用账号——真有问题，
         # 真实流量会照常记账；测试顺手把账号关掉才是「越测越乱」。
-        account.note_error(str(exc)[:80], cooldown=0)
+        account.note_error(str(exc)[:80], cooldown=0,
+                           penalty=wb_accounts.ERR_TRANSIENT)
         row["fails"] = int(account.fails)
         return row
 
@@ -18993,7 +19246,30 @@ class Handler(BaseHTTPRequestHandler):
         if not hasattr(self, mname):
             self.send_error(501, "Unsupported method (%r)" % self.command)
             return
-        getattr(self, mname)()
+        try:
+            getattr(self, mname)()
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            # 客户端自己断了：没什么可回应的。
+            self.close_connection = True
+            return
+        except Exception as exc:
+            # 处理函数里的异常**不能**逃到 socket 层。
+            #
+            # 标准库的 socketserver 只接住 socket.timeout；其它异常一路冒到
+            # handle_error()，结果是 traceback 打到 stderr、连接被直接 RST ——
+            # 客户端看到的是「连接被重置」，既没有 HTTP 状态码也没有错误正文，
+            # 用量账本里也不会留下这一笔。运维看到的只有一段栈。
+            #
+            # 这里把它变成一个正经的 500：客户端知道是服务端的问题，
+            # 账本记得到，栈也照样打（要排查时看得到）。
+            log("unhandled error in %s: %s" % (mname, exc_detail(exc, 500)),
+                level="ERROR")
+            try:
+                self._error(500, "internal gateway error", "api_error")
+            except Exception:
+                # 连错误都发不出去（连接已断/响应已开始）：只能放弃。
+                self.close_connection = True
+            return
         self.wfile.flush()
     def handle(self):
         try:
@@ -19005,7 +19281,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/0.1.7"
+    server_version = "wb-proxy/0.1.0"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -23915,6 +24191,9 @@ def _bootstrap_runtime(args):
     POOL.load()
     POOL.apply_proxy_slots()
     POOL.apply_reserve_credits()
+    # 让池子知道「现在谁在忙」：选号时在途数少的账号优先。wb_accounts 不能反向
+    # import 本模块（会成环），所以在这里把只读取值函数注入过去。
+    POOL.set_inflight_provider(account_inflight_count)
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.

@@ -346,10 +346,21 @@ class SettingsCacheTests(unittest.TestCase):
         first["b"] = "new"
         self.assertEqual(wb_settings.load(self.dir), {"a": 1})
 
-    def test_corrupt_file_reads_empty(self):
+    def test_corrupt_file_is_marked_unreadable(self):
+        """损坏的文件**不能**读成空 dict。
+
+        旧断言是 `load() == {}` —— 那正是漏洞本身：「文件不存在」与「文件存在
+        但坏了」被当成同一件事，于是面板密码回落成 admin、API Key 列表变空
+        ⇒ 网关对所有能碰到端口的人开放。
+
+        现在读不出来会被打上标记，安全判定据此 fail closed
+        （见 wb_settings._UNREADABLE 与 tests/_test_settings_fail_closed.py）。
+        """
         with open(self.path, "w", encoding="utf-8") as fh:
             fh.write("{not json")
-        self.assertEqual(wb_settings.load(self.dir), {})
+        data = wb_settings.load(self.dir)
+        self.assertTrue(data.get(wb_settings._UNREADABLE))
+        self.assertTrue(wb_settings.settings_unreadable(self.dir))
 
 
 if __name__ == "__main__":

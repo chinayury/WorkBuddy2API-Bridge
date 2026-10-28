@@ -54,10 +54,10 @@ class AlertsConfigTest(unittest.TestCase):
         self.assertEqual(wb_alerts.config(self.tmp), {})
 
     def test_webhook_is_read_back_without_the_secret(self):
-        write_settings(self.tmp, {"webhook": {"url": "https://x.test/h",
+        write_settings(self.tmp, {"webhook": {"url": "https://example.com/h",
                                               "secret": "s3cr3t"}})
         cfg = wb_alerts.config(self.tmp)
-        self.assertEqual(cfg["webhook"]["url"], "https://x.test/h")
+        self.assertEqual(cfg["webhook"]["url"], "https://example.com/h")
         self.assertEqual(cfg["webhook"]["secret"], "s3cr3t")
         # 面板读的那一份必须不含 secret
         public = wb_settings.alerts(self.tmp)
@@ -89,7 +89,7 @@ class AlertsDebounceTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb-alerts-deb-")
-        write_settings(self.tmp, {"webhook": {"url": "https://x.test/h"}})
+        write_settings(self.tmp, {"webhook": {"url": "https://example.com/h"}})
         wb_alerts.reset()
 
     def test_single_hit_does_not_fire(self):
@@ -122,7 +122,7 @@ class AlertsDebounceTest(unittest.TestCase):
 class AlertsDeliveryTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb-alerts-del-")
-        write_settings(self.tmp, {"webhook": {"url": "https://x.test/h",
+        write_settings(self.tmp, {"webhook": {"url": "https://example.com/h",
                                               "secret": "s3cr3t"}})
         wb_alerts.reset()
         self.sent = []
@@ -236,7 +236,7 @@ class AlertsSettingsWriteTest(unittest.TestCase):
         self.addCleanup(wb_alerts.reset)
 
     def test_set_and_clear(self):
-        wb_settings.set_alerts(self.tmp, {"webhook": {"url": "https://x.test/h",
+        wb_settings.set_alerts(self.tmp, {"webhook": {"url": "https://example.com/h",
                                                        "secret": "s"}})
         self.assertTrue(wb_settings.alerts(self.tmp)["webhook"])
         wb_settings.set_alerts(self.tmp, {})
@@ -244,7 +244,7 @@ class AlertsSettingsWriteTest(unittest.TestCase):
 
     def test_settings_file_stays_private(self):
         """settings.json 含 secret，权限必须是 0600。"""
-        wb_settings.set_alerts(self.tmp, {"webhook": {"url": "https://x.test/h",
+        wb_settings.set_alerts(self.tmp, {"webhook": {"url": "https://example.com/h",
                                                        "secret": "s"}})
         path = os.path.join(self.tmp, "settings.json")
         mode = os.stat(path).st_mode & 0o777

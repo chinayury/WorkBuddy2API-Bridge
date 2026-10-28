@@ -1,0 +1,6 @@
+data: {"id": "chatcmpl-wb-test", "model": "deepseek-v4-pro", "object": "chat.completion.chunk", "created": 1, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "", "reasoning_content": "", "function_call": null, "refusal": "", "tool_calls": [], "extra_fields": null}, "logprobs": null, "finish_reason": ""}], "usage": null}
+
+data: {"id": "chatcmpl-wb-test", "model": "deepseek-v4-pro", "object": "chat.completion.chunk", "created": 1, "choices": [{"index": 0, "delta": {"content": "北京", "reasoning_content": "", "function_call": null, "refusal": "", "tool_calls": [], "extra_fields": null}, "logprobs": null, "finish_reason": ""}], "usage": null}
+
+data: {"id": "chatcmpl-wb-test", "model": "deepseek-v4-pro", "object": "chat.completion.chunk", "created": 1, "choices": [{"index": 0, "delta": {"content": "今天晴。", "reasoning_content": "", "function_call": null, "refusal": "", "tool_calls": [], "extra_fields": null}, "logprobs": null, "finish_reason": "stop"}], "usage": null}
+

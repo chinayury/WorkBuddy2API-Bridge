@@ -10888,6 +10888,18 @@ async function bootPanel(){
   } else {
     const pwdFromUrl = new URLSearchParams(window.location.search).get('pwd');
     if(pwdFromUrl){
+      // 面板口令来自 URL 时，**立刻**把它从地址栏里去掉。
+      //
+      // 与上面 ?key= 的处理同款：留在地址栏里，它会进浏览器历史、
+      // 同步到别的设备、出现在屏幕共享里，还会作为 Referer 发给站点外的
+      // 资源。口令比 API Key 更敏感 —— 它能打开整个管理面板。
+      // 这里只删 pwd 一个参数，别的（?tab= 等）留着。
+      try{
+        const rest = new URLSearchParams(window.location.search);
+        rest.delete('pwd');
+        const qs = rest.toString();
+        history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : ''));
+      }catch(e){}
       const input = document.getElementById('panelPwdInput');
       if(input) input.value = pwdFromUrl;
       await submitPanelLogin();
