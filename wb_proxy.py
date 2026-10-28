@@ -24,7 +24,6 @@ import heapq
 import http.client
 import io
 import ipaddress
-import math
 from collections import deque
 import re
 import atexit
@@ -59,6 +58,7 @@ def _env_float(name, default, minimum=0.0):
     except (TypeError, ValueError):
         return default
     return value if value >= minimum else default
+
 
 import uuid
 import wb_accounts
@@ -14818,7 +14818,7 @@ def _load_restriction_state_locked(now):
         for realm in ("cn", "intl"):
             until = holds.get(realm, 0)
             if isinstance(until, bool) or not isinstance(until, (int, float)) \
-                    or not math.isfinite(until) or until < 0:
+                    or not _finite_number(until) or until < 0:
                 raise ValueError("restriction expiry")
             if until > now:
                 restored_holds[realm] = until
@@ -14831,7 +14831,7 @@ def _load_restriction_state_locked(now):
                 if not isinstance(digest, str) \
                         or not re.fullmatch(r"[0-9a-f]{64}", digest) \
                         or isinstance(at, bool) \
-                        or not isinstance(at, (int, float)) or not math.isfinite(at):
+                        or not isinstance(at, (int, float)) or not _finite_number(at):
                     raise ValueError("restriction event")
                 if 0 <= now - at <= RESTRICTION_WAVE_WINDOW:
                     kept[digest] = at
