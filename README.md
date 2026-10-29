@@ -7,6 +7,7 @@
 >
 > **本仓库 fork 自 [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（上游 v1.8.0，MIT 协议）。**
 >
+> - **本仓库地址**：<https://github.com/chinayury/WorkBuddy2API-Bridge>（曾用名 `chinayury/workbuddy2api-hub`，旧地址永久跳转到此处）；
 > - **上游仓库**：<https://github.com/ardeyouxipianyi/workbuddy2api-hub> —— 本仓库的基线代码整体来自该仓库；上游 `main` 分支保留在本 fork 内，可随时比对与同步；
 > - **版本编号**：本仓库使用独立的 `0.1.x` 版本线（上游使用 `1.x`），当前版本见 [`VERSION`](VERSION)，逐版发布记录见 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)；
 > - **同步上游**：`git fetch upstream && git merge upstream/main`（`upstream` 指向官方仓库，`origin` 指向本 fork）；
@@ -36,7 +37,7 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.33-2496ED?style=flat-square" alt="Version 1.7.33"></a>
+  <a href="https://github.com/chinayury/WorkBuddy2API-Bridge/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-2496ED?style=flat-square" alt="Version 0.1.0"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -498,6 +499,8 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 ## 六、版本更新记录 (Changelog)
 
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
+
+- **仓库改名为 `WorkBuddy2API-Bridge`**：GitHub 仓库从 `chinayury/workbuddy2api-hub` 改名为 [`chinayury/WorkBuddy2API-Bridge`](https://github.com/chinayury/WorkBuddy2API-Bridge)，与项目名一致；旧地址永久跳转到新地址，既有 clone 不受影响。README 顶部版本徽章此前指向上游的 releases 页并显示上游版本号，现改为指向本仓库的 releases 与自己的 `0.1.x` 版本线；两份 v0.1.0 交付文档里的 `git clone` 与 `cd` 目录名同步更新。**未变**：镜像名 `workbuddy2api-hub`、compose 服务名 `wb-proxy`、HTTP `Server` 头 `wb-proxy/<版本>`、服务器部署路径 `/opt/workbuddy2api-hub/`，以及发布产物名 `workbuddy2api-hub-v*.zip` —— 这些是既有部署与升级链路依赖的标识符。 / **Repository renamed to `WorkBuddy2API-Bridge`**: the GitHub repository moved from `chinayury/workbuddy2api-hub` to [`chinayury/WorkBuddy2API-Bridge`](https://github.com/chinayury/WorkBuddy2API-Bridge), matching the project name; the old address redirects permanently, so existing clones keep working. The release badge in the README header pointed at the upstream releases page and showed the upstream version; it now points at this repository's releases and at this fork's own `0.1.x` line, and the `git clone` / `cd` lines in the two v0.1.0 delivery documents were updated to match. **Unchanged**: the image name `workbuddy2api-hub`, the compose service name `wb-proxy`, the HTTP `Server` header `wb-proxy/<version>`, the server deploy path `/opt/workbuddy2api-hub/`, and the release asset names `workbuddy2api-hub-v*.zip` — those are the identifiers existing deployments and the upgrade path depend on.
 
 - **实验性桌面 chat 请求头一致性（默认关闭）**：设置进程环境 `WB_DESKTOP_CHAT_COMPAT=1` 后重启，仅桌面产品的 chat 去除浏览器请求头、补齐 SDK runtime 头及 B3 parent span。参考 [workbuddy2api-panel 的桌面报文对照](https://github.com/misakano7545/workbuddy2api-panel/blob/e7d1e70bb0234552eba31706672ad0a601877b5f/internal/upstream/headers.go)，未独立复核其原始抓包。沿用现有版本/OS/架构覆盖项，不硬编码 Windows，不伪造设备 token；CLI、VSCode、计费 REST、请求体和风控退避不变。不是 TLS 指纹模拟或免封保证。 / **Experimental desktop chat header consistency (off by default)**: set the process environment `WB_DESKTOP_CHAT_COMPAT=1` and restart to remove browser headers and add SDK runtime headers and a B3 parent span for desktop chat only. The linked panel project reports this desktop profile; its raw captures have not been independently verified here. Existing version/OS/architecture overrides are respected, with no hard-coded Windows or invented device tokens. CLI, VSCode, billing REST, request bodies and abuse backoff are unchanged. This is not TLS impersonation or a ban-avoidance guarantee.
 

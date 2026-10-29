@@ -24,8 +24,8 @@
 ## 二、首次部署（Docker）
 
 ```sh
-git clone https://github.com/chinayury/workbuddy2api-hub.git
-cd workbuddy2api-hub/release
+git clone https://github.com/chinayury/WorkBuddy2API-Bridge.git
+cd WorkBuddy2API-Bridge/release
 
 # 面板密码：生成随机强口令，不要用默认的 admin
 PANEL_PWD=$(python3 -c "import secrets;print(secrets.token_urlsafe(24))")
