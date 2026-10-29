@@ -74,14 +74,43 @@ def tearDownModule():
     wb_alerts._post = _real_post
 
 
+def _quiesce():
+    """停掉后台投递线程并清空队列，让每个测试从干净状态开始。
+
+    告警是**异步**投递的：`emit()` 只是把一项放进队列，真正发送的是
+    后台 worker。上一个测试 enqueue 的项可能还没被取走，下一个测试的
+    setUp 就已经装好了自己的假 `_post` —— 于是那一项落进下一个测试的
+    `sent` 里，「什么都没发」这类断言就会莫名失败。
+
+    这个竞态一直都在，只是以前被掩盖着：那时每个测试结束后 `_post` 被换回
+    真实实现，迟到的项打到真实网络上，进不了任何测试的 `sent`。改成模块级
+    假投递（为了不出网）之后它才显形。
+
+    ⇒ 每个测试开始前先收尾：让 worker 退出、把队列倒空、再把它标记为需要
+    重启（`ensure_worker()` 会按需重新起一个）。
+    """
+    wb_alerts._stop.set()
+    worker = wb_alerts._worker
+    if worker is not None:
+        worker.join(timeout=2.0)
+    while True:
+        try:
+            wb_alerts._queue.get_nowait()
+        except Exception:
+            break
+    wb_alerts._worker = None
+
+
 class AlertsTestBase(unittest.TestCase):
-    """所有告警套件共用的前置：DNS 固定、投递不出网。"""
+    """所有告警套件共用的前置：DNS 固定、投递不出网、状态干净。"""
 
     def setUp(self):
+        _quiesce()
         patcher = mock.patch.object(wb_alerts.socket, "getaddrinfo",
                                     fake_getaddrinfo)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.addCleanup(_quiesce)
 
 
 def write_settings(directory, alerts):
