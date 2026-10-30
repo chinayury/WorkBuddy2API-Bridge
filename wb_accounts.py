@@ -777,7 +777,7 @@ HALF_OPEN_RECOVERED_TTL = 120.0
 # 老实现在这几档上的区分是「有就分开处理，没有就一律冷却」：
 # 任何一次 401（哪怕是上游代理/WAF 偶发返回的）刷新失败后都会给账号记 60 秒冷却，
 # 任何一次连接层异常都会喂熔断计数。误伤的代价是：救火的时候又摘掉一批号，
-# 池子容量���降 —— 2026-10-26 晚的连坐事故里就有这类误伤。
+# 池子容量骤降 —— 2026-10-26 晚的连坐事故里就有这类误伤。
 #
 # 分类的目的：**让不该背锅的失败真的不背锅**，而不是换个地方记。
 
@@ -1085,6 +1085,16 @@ class Account(object):
         # otherwise a single throttled model blackholes every request on the pool.
         # Deliberately runtime-only (not persisted): see VOLATILE_FIELDS.
         self.model_cooldowns = {}
+        # 「这条冷却是上游判定额度用满（6004）」的标记：模型 -> 撞线时刻。
+        # 与 model_cooldowns 同款运行时态（重启即清零），但窗口探针会把
+        # 事实落在 accounts/model_windows.json 里，重启后由
+        # restore_window_cooldowns() 连同冷却一起挂回来（issue #668）。
+        #
+        # 为什么单独一张表：凭证档的 model_caps 只覆盖免费模型（限额联动的
+        # 范围），收费模型撞 6004 一样是"配额用尽"，但它不写 model_caps，
+        # 于是面板把它显示成"429 临时限流（60s~10m 的短窗口）"，而真实恢复
+        # 时刻在 20 小时以后。
+        self.model_cap_marks = {}
         # 每个模型冷却窗口是**什么时候挂上的**（model -> epoch）。model_cooldowns
         # 只留恢复时刻，起始时刻以前被丢掉：面板因此无法如实说「限流时刻」，只能
         # 用「—」占位，把 60s 的短时 parking 和几小时的 6004 撞线画成一样。与
@@ -1156,7 +1166,7 @@ class Account(object):
         # 上游对**从未被真正激活过的凭据**会在第一次派发时直接判 403 / code 11140
         # 「账号存在异常行为，已被限制使用」——拒绝发生在**首次触达**，不是慢慢
         # 积累出来的。实测（2026-10-26 晚，19 账号池）：当晚两次整池连坐
-        # （19:50:47、20:33:22）都��派发到这种账号触发；四个被 11140 的账号
+        # （19:50:47、20:33:22）都是派发到这种账号触发；四个被 11140 的账号
         # 网关侧成功次数全是 0。而跑过成功的账号从来没被 11140 过。
         #
         # 外观完全不能用来判：被封的号和没被封的号，积分水位、签到连续天数、
@@ -1232,9 +1242,9 @@ class Account(object):
         # AccountPool.apply_daily_credit_limit(); 0 disables the guard.
         self.daily_credit_limit = 0
         self.daily_credits_today = None
-        # The realm's free model ids, pushed by the same apply call. Empty
-        # until then, and an unknown model counts as paid, so the guard
-        # fails closed instead of leaking spend through unseen names.
+        # The realm's free model ids, pushed by the daily-credit and reserve
+        # apply calls. Empty until then, and an unknown model counts as paid,
+        # so both guards fail closed instead of leaking spend through unseen ids.
         self.free_models = frozenset()
         # Per-model daily guard: once ONE model burned the configured tokens
         # today the account stops being handed out for that model only -
@@ -1342,8 +1352,22 @@ class Account(object):
                 entry["startedAt"] = int(started)
             # 撞线时间只在 cap 还在恢复期内时带上：它同时说明这次禁用是
             # 「额度用满」（6004）而不是一次临时限流，面板据此显示两段时间。
+            #
+            # 两个来源：凭证档的 model_caps（免费模型，限额联动范围内），以及
+            # 运行时/窗口探针记下的 model_cap_marks（任何模型，含国内版按积分
+            # 计费的 deepseek-v4.1-flash）。后者补上的是"付费模型撞 6004"这个
+            # 事实——不补的话面板只能写成"临时限流（60s~10m）"，而真实恢复
+            # 时刻在 20 小时以后（issue #668）。
+            capped_at = 0
             if self.cap_until(model, now) > 0:
-                entry["cappedAt"] = int(self.model_caps[model]["at"])
+                capped_at = int(self.model_caps[model]["at"])
+            else:
+                try:
+                    capped_at = int(self.model_cap_marks.get(model) or 0)
+                except (TypeError, ValueError):
+                    capped_at = 0
+            if capped_at:
+                entry["cappedAt"] = capped_at
             models.append(entry)
         return error, deadline, models, detail, restricted
 
@@ -1403,6 +1427,7 @@ class Account(object):
             # 账号档位（#505）：面板在「会员类型」旁显示包名与读取时刻。
             "tier": self.tier,
             "reserveCredits": int(self.reserve_credits or 0),
+            # Account-level state, even while an explicitly free model serves.
             "reserveBlocked": self.reserve_blocked(),
             "dailyTokenLimit": int(self.daily_token_limit or 0),
             "dailyTokensToday": (int(self.daily_tokens_today)
@@ -1528,14 +1553,18 @@ class Account(object):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
 
-    def reserve_blocked(self):
-        """True when the low-credit guard should keep this account idle.
+    def reserve_blocked(self, model=None):
+        """True when the low-credit guard should keep this account off `model`.
 
         Only a *known* balance can block: an account whose credits were never
         fetched stays usable, otherwise a fresh install would look empty.
+        A positive reserve exempts models the realm catalogue marks free;
+        paid, unknown, and model-less calls retain the account-level guard.
         """
         reserve = int(self.reserve_credits or 0)
         if reserve <= 0:
+            return False
+        if model and self.model_is_free(model):
             return False
         credits = self.credits
         if not isinstance(credits, dict):
@@ -1822,6 +1851,49 @@ class Account(object):
                 out.add(mid)
         return out
 
+    def model_cooldown_until(self, model=None):
+        """这个模型当前的冷却截止时刻（没有冷却则 0）。"""
+        if not model:
+            return 0.0
+        try:
+            return float((self.model_cooldowns or {}).get(model, 0.0))
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    def blocked_by_model_cooldown(self, model=None, now=None):
+        """这个账号此刻是不是"只因为这个模型还在上游限流窗口里"而不可用。
+
+        模型冷却是上游自己的回答："这个模型的窗口用满了，到 T 重置"。凭证本身
+        没问题，账号池也没有坏，只是在等。因此池级报错要说清"在等什么、等到
+        什么时候"，而不是报成"没有可用账号"（issue #665）。
+
+        判定与 `ready()` 同序（人工黑名单 → 档位 → 余额保留 → 日限额 → 积分
+        限额 → 模型日限额），只是把"临期凭证"那条排除在外：刷新是网络动作，
+        这条判断要保持只读。
+        """
+        now = time.time() if now is None else now
+        if not model:
+            return False
+        if self.model_cooldown_until(model) <= now:
+            return False
+        if not self.enabled or not self.access_token \
+                or getattr(self, "token_expired", False):
+            return False
+        if self.model_disabled(model):
+            return False
+        if (not getattr(self, "is_paid_user", False)
+                and wb_tiers.requires_pro(model, self.realm)):
+            return False
+        if self.reserve_blocked():
+            return False
+        if self.daily_limit_blocked():
+            return False
+        if self.credit_limit_blocked(model):
+            return False
+        if self.model_token_limit_blocked(model):
+            return False
+        return True
+
     def unavailable_reason(self, model=None):
         """这个账号此刻为什么接不了单；可用时返回空字符串。
 
@@ -1864,7 +1936,7 @@ class Account(object):
             elif label.startswith("模型") and self.unscoped_streak > 1:
                 streak = "（连续第 %d 次）" % self.unscoped_streak
             return "%s 剩余 %s%s" % (label, _human_left(until - now), streak)
-        if self.reserve_blocked():
+        if self.reserve_blocked(model):
             return "余额低于保留线"
         if self.daily_limit_blocked():
             return "今日 Token 额度用尽"
@@ -1927,9 +1999,9 @@ class Account(object):
             return False
         if self.throttle_wait(model=model) > 0:
             return False
-        # Parked below the reserve: serving a request here is what would push
-        # the balance to zero and trigger the upstream reminder SMS.
-        if self.reserve_blocked():
+        # A positive reserve stops paid requests below the floor; catalogue-
+        # free models cannot spend the balance this guard protects.
+        if self.reserve_blocked(model):
             return False
         # Today's token budget is spent: keep the seat for tomorrow instead
         # of letting the upstream answer 429 for the rest of the day.
@@ -1949,20 +2021,32 @@ class Account(object):
         remaining = exp - time.time()
         if remaining > 120:
             return True
-        # 令牌快到期了。refresh=False 时**不**去刷新，直接判定为不可用 ——
-        # 选号路径会用它来扫过整个账号池，而 ready() 带刷新副作用时，
-        # 一次派发会对每个临期账号各发一次网络请求（19 个账号 = 19 次串行
-        # 刷新，每次最长 30 秒）。旧实现只扫到第一个可用账号就停，
-        # 所以只有一次刷新；改成先收集全部候选后这个副作用被放大了。
-        # 带刷新副作用的判定留给真正要用这个账号的那一步（见 open_upstream）。
-        if not refresh:
-            return False
+        # 令牌快到期了。refresh=False 时**不**去刷新，但**仍算可用** ——
+        # 刷新是网络动作，只读口径不该带它（探针不该因一次刷新失败而抖动，
+        # 更不该把一次失败放大成每个模型一次重试）。
+        #
+        # 为什么「快到期」不等于「不可用」：选号路径用 refresh=False 扫过整个
+        # 账号池，而真正要用这个账号的那一步（wb_proxy.open_upstream）会用
+        # token_needs_refresh() 给**选中的那一个**账号刷一次，刷新失败就换号。
+        # 在这里就判成不可用，等于把刷新这条路整个堵死：池里所有账号都临期时，
+        # 网关会报「无可用账号」(503)，而这些号其实每个都能刷新后正常服务。
+        #
+        # 旧实现只扫到第一个可用账号就停，所以只有一次刷新；改成先收集全部
+        # 候选后这个副作用被放大 —— 解法是选号只读、刷新按需，而不是把
+        # 临期账号从候选里剔掉。
         if remaining > 0:
             # Refresh is a last resort and its result decides availability.
             # Returning True unconditionally here kept handing out an account
             # whose token was about to expire, so requests went upstream with a
             # stale credential and came back 401/403.
+            if not refresh:
+                # 只读口径（/health 的按模型统计）：不发起刷新，也不把"快到期"
+                # 算成不可用。刷新是网络动作，探针不该因它抖动，也不该把一
+                # 次失败放大成每个模型一次重试。
+                return True
             return self.refresh()
+        if not refresh:
+            return True
         return self.refresh()
 
     def token_needs_refresh(self, within=120.0):
@@ -2235,6 +2319,12 @@ class Account(object):
 
     def can_daily_chat(self):
         if self.realm != "intl":
+            return False
+        # 403 / code 11140 is an account-level restriction. Scheduled daily
+        # activity must respect the same persisted restriction window as normal
+        # chat dispatch, otherwise every later activity slot probes the account
+        # again even though the upstream already told us to stop.
+        if self.restricted_until > time.time():
             return False
         if not self.last_daily_chat:
             return True
@@ -2789,6 +2879,11 @@ class Account(object):
         """
         if self.realm != "intl":
             return {"ok": False, "error": "daily chat is only for international accounts"}
+        # 11140 的限制窗口要和普通 chat 一样先挡住；这里单独返回失败形状，
+        # 不能把「账号受限」伪装成「今日活跃已完成」。
+        if self.restricted_until > time.time():
+            return {"ok": False, "skipped": True, "restricted": True,
+                    "error": "账号处于上游风控限制窗口，跳过每日活跃"}
         # 当日活跃成功后再触发（下一个定时点、手动补跑、并发重复调度）直接
         # 跳过，连桌面腿也不发：这一天的 30/50 积分已经拿到了。
         if not self.can_daily_chat():
@@ -2890,6 +2985,22 @@ class Account(object):
                 err = exc.read().decode("utf-8", "replace")
             except Exception:
                 err = str(exc)
+            # Normal chat already treats 403/code 11140 as an account-level
+            # restriction and persists restrictedUntil. Daily activity used to
+            # bypass that path and therefore retried the same restricted account
+            # at later scheduler slots. Mirror the existing governance here.
+            upstream_code = None
+            try:
+                body = json.loads(err or "{}")
+                upstream_code = body.get("code") if isinstance(body, dict) else None
+            except Exception:
+                pass
+            if exc.code == 403 and upstream_code == 11140:
+                self.note_restricted(detail=err)
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
+                return {"ok": False, "restricted": True,
+                        "error": f"HTTP 403 / 11140: {err[:100]}"}
             return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -4102,6 +4213,41 @@ def _human_delta(seconds):
     return "%d min" % int(seconds / 60)
 
 
+AUTH_CHALLENGE_MARK = "www-authenticate: "
+
+
+def auth_challenge(headers):
+    """The `WWW-Authenticate` value of a 401, whitespace-collapsed and bounded.
+
+    Gateways such as APISIX answer a dead token with an HTML page whose reason
+    lives only in this header (`Bearer realm="copilot", error="invalid_token"`).
+    Reading it is what separates "the credential is bad" from "a proxy page
+    answered", which the body alone cannot tell apart.
+    """
+    try:
+        value = headers.get("www-authenticate") if headers else ""
+    except Exception:
+        return ""
+    return " ".join(str(value or "").split())[:160]
+
+
+def http_error_message(exc, detail, limit=None):
+    """Diagnosis string for an HTTPError: `HTTP <code>: <body>`, plus the challenge.
+
+    The challenge goes *before* the body on purpose. Callers truncate the label
+    (80/150 chars) and `note_error` keeps only 200, so a header appended at the
+    end would be the first thing cut - exactly the evidence that matters.
+    """
+    body = str(detail or "")
+    if limit:
+        body = body[:limit]
+    code = getattr(exc, "code", "")
+    challenge = auth_challenge(getattr(exc, "headers", None))
+    if not challenge:
+        return "HTTP %s: %s" % (code, body)
+    return "HTTP %s (%s%s): %s" % (code, AUTH_CHALLENGE_MARK, challenge, body)
+
+
 def _auth_failure_text(text):
     """True for a credential-shaped 401, not an intermediate proxy page.
 
@@ -4109,12 +4255,20 @@ def _auth_failure_text(text):
     that the token is dead: parking the account on it would take a healthy
     credential out of rotation until a manual re-login (#435). Only mark the
     account when the failure itself names authorization.
+
+    RFC 6750 `error="invalid_token"` is such a naming, and it outranks the HTML
+    bail-out: APISIX (copilot.tencent.com) rejects a dead token with an HTML
+    page and puts the reason in `WWW-Authenticate`, so the body alone looks
+    exactly like a proxy page while the header says the credential is bad.
+    `http_error_message()` keeps that header in the diagnosis string.
     """
     lower = str(text or "").lower()
+    if "invalid_token" in lower or "invalid-token" in lower:
+        return True
     if "<html" in lower:
         return False
     return ("401" in lower or "unauthorized" in lower or "authorization" in lower
-            or "token expired" in lower or "invalid_token" in lower)
+            or "token expired" in lower)
 
 
 def _human_left(seconds):
@@ -4576,6 +4730,16 @@ class AccountPool(object):
                     continue
                 if account.arm_model_cooldown(model, row.get("reset_at")):
                     restored.setdefault(uid, []).append(model)
+                # 这条窗口是上游判定额度用满（6004）时，把撞线时刻一起挂回来：
+                # 面板据此显示"配额耗尽"而不是"临时限流"，重启后也不丢这个
+                # 事实（凭证档的 model_caps 只覆盖免费模型，issue #668）。
+                if row.get("cap"):
+                    try:
+                        cap_at = float(row.get("cap_at") or 0.0)
+                    except (TypeError, ValueError):
+                        cap_at = 0.0
+                    if cap_at:
+                        account.model_cap_marks[model] = cap_at
         for uid, mids in sorted(restored.items()):
             self.log("account %s: 模型 %s 仍在上游限流窗口内（重启后按窗口恢复）"
                      % (uid[:8], ", ".join(mids)))
@@ -4802,7 +4966,7 @@ class AccountPool(object):
                 else:
                     account.proxy = account.proxy_legacy
 
-    def apply_reserve_credits(self, values=None):
+    def apply_reserve_credits(self, values=None, free_models=None):
         """Re-resolve the low-credit guard for every account.
 
         Same shape as apply_proxy_slots(): settings.json is the source of
@@ -4810,7 +4974,8 @@ class AccountPool(object):
         needs no extra settings lookup. `values` is the guard resolved per
         realm ({"global": g, "intl": ..., "cn": ...}); each account picks its
         own realm, so a per-realm override lands only on that realm's accounts
-        while the global default keeps covering both.
+        while the global default keeps covering both. `free_models` is the
+        caller's realm -> free-id catalogue view; None retains the last one.
         """
         import wb_settings
 
@@ -4819,6 +4984,9 @@ class AccountPool(object):
         with self._lock:
             for account in self.accounts:
                 account.reserve_credits = _realm_limit(values, account.realm)
+                if free_models is not None:
+                    account.free_models = frozenset(
+                        free_models.get(account.realm) or ())
         return values
 
     def apply_expiring_window(self, values=None):
@@ -5008,11 +5176,19 @@ class AccountPool(object):
             return [a for a in self.accounts
                     if (not realm or a.realm == realm) and a.task_active()]
 
-    def count_ready(self, realm=None, model=None, allowed=None):
+    def count_ready(self, realm=None, model=None, allowed=None, refresh=True):
+        """How many accounts can serve right now.
+
+        `refresh=False` keeps the count read-only: `Account.ready()` normally
+        refreshes a credential that is about to expire, and a probe that asks
+        "how many accounts are left" must not turn into a network call per
+        model (issue #667).
+        """
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot
-                   if a.enabled and a.access_token and a.ready(model=model, refresh=False)
+                   if a.enabled and a.access_token
+                   and a.ready(model=model, refresh=refresh)
                    and (allowed is None or a.uid in allowed))
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,

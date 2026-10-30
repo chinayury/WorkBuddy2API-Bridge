@@ -107,7 +107,7 @@ def main(argv=None):
         #
         # 旧实现读 payload["root"]：那个文件是无特权网关写的，而这段代码跑在
         # 特权执行器里 —— 让特权进程按请求文件指定的路径去写文件，等于把
-        # 「写哪���」的决定权交给了低权限一方。（同目录的 wb_update_request.py
+        # 「写哪里」的决定权交给了低权限一方。（同目录的 wb_update_request.py
         # 就是按「package_root() == app_root()」这种**结构判断**来决定 profile，
         # 不采信文件里的路径。）
         root = args.root

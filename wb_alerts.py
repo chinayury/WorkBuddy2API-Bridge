@@ -316,7 +316,7 @@ def _is_internal_host(host):
 def _safe_error_text(exc):
     """把投递异常压成**不含响应体**的一行短文本。
 
-    urllib 的 HTTPError / URLError 在 `str(exc)` 里会带上**响��正文** ——
+    urllib 的 HTTPError / URLError 在 `str(exc)` 里会带上**响应正文** ——
     直接回显给面板就等于把内网服务的返回内容泄露出去（SSRF 读）。
     这里只保留异常类型与状态码，正文一律丢弃。
     """

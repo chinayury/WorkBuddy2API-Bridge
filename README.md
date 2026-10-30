@@ -5,22 +5,28 @@
 > 代码标识符、镜像名 `workbuddy2api-hub`、compose 服务名 `wb-proxy` 与 HTTP `Server` 头 `wb-proxy/<版本>` **保持不变**，
 > 以免影响既有部署与升级链路。
 >
-> **本仓库 fork 自 [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（上游 v1.8.0，MIT 协议）。**
+> **本仓库 fork 自 [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub)（上游 v1.9.2，MIT 协议）。**
 >
 > - **本仓库地址**：<https://github.com/chinayury/WorkBuddy2API-Bridge>（曾用名 `chinayury/workbuddy2api-hub`，旧地址永久跳转到此处）；
 > - **上游仓库**：<https://github.com/ardeyouxipianyi/workbuddy2api-hub> —— 本仓库的基线代码整体来自该仓库；上游 `main` 分支保留在本 fork 内，可随时比对与同步；
-> - **版本编号**：本仓库使用独立的 `0.1.x` 版本线（上游使用 `1.x`），当前版本见 [`VERSION`](VERSION)，逐版发布记录见 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)；
-> - **同步上游**：`git fetch upstream && git merge upstream/main`（`upstream` 指向官方仓库，`origin` 指向本 fork）；
-> - **本 fork 的增量**：账号池治理与未验证账号准入闸门、告警通道 SSRF 防护与密钥打码、限制暂停落盘、调度器整点排程与流式工具调用修复等，详见 `docs/CHANGELOG-v0.1.*.md`。
+> - **版本编号**：本仓库使用独立的 `0.x` 版本线（上游使用 `1.x`），当前版本见 [`VERSION`](VERSION)，逐版发布记录见 [`docs/CHANGELOG-v0.2.0.md`](docs/CHANGELOG-v0.2.0.md) 与上游侧的 [`docs/CHANGELOG.md`](docs/CHANGELOG.md)；
+> - **同步上游**：本仓库与上游**没有共同祖先**（v0.1.0 基线是从已验证发布包还原的，提交历史重新起过），
+>   因此**不能**直接 `git merge upstream/main`；正确做法是以「上游基线提交」为 base 做三方合并、冲突逐处人工裁决 —— 本次 v1.9.2 同步的完整流程与 15 处冲突的裁决理由见 **[docs/UPSTREAM-TRACKING-v1.9.2.md](docs/UPSTREAM-TRACKING-v1.9.2.md)**；
+> - **本 fork 的增量**：账号池治理与未验证账号准入闸门、告警通道 SSRF 防护与密钥打码、限制暂停落盘、调度器整点排程与流式工具调用修复等，详见 `docs/CHANGELOG-v0.1.*.md` 与 `docs/CHANGELOG-v0.2.0.md`。
 >
-> **This repository is a fork of [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub) (upstream v1.8.0, MIT).** The upstream `main` branch is kept in this fork for comparison and syncing. This fork carries its own `0.1.x` version line — see [`VERSION`](VERSION) and [`docs/CHANGELOG.md`](docs/CHANGELOG.md).
+> **This repository is a fork of [`ardeyouxipianyi/workbuddy2api-hub`](https://github.com/ardeyouxipianyi/workbuddy2api-hub) (upstream v1.9.2, MIT).** The upstream `main` branch is kept in this fork for comparison and syncing. This fork carries its own `0.x` version line — see [`VERSION`](VERSION) and [`docs/CHANGELOG-v0.2.0.md`](docs/CHANGELOG-v0.2.0.md).
 
 > [!IMPORTANT]
-> **项目进入低频维护（2026-10-23） / Low-frequency maintenance**
+> **上游维护节奏（2026-10-30 更新） / Upstream maintenance cadence**
 >
-> 大幅降低更新频率与 Issue / PR 处理速度。请先阅读风险说明，再决定是否继续使用。
+> 上游曾在 2026-10-23 声明进入低频维护，但自 2026-10-24 起恢复高频发版 ——
+> 7 天内连发 **v1.8.0 / v1.9.0 / v1.9.1 / v1.9.2**（本仓库已同步到 v1.9.2）。
+> 这意味着上游修复与收紧都来得更快，**请先阅读下面的风险说明，再决定是否继续使用**。
 >
-> Updates and responses to issues / pull requests will be significantly reduced. Read the risk notice below before continuing.
+> The upstream announced low-frequency maintenance on 2026-10-23 but resumed frequent releases
+> from 2026-10-24, shipping v1.8.0, v1.9.0, v1.9.1 and v1.9.2 within seven days (this fork is
+> synced to v1.9.2). Both fixes and tightening now arrive faster - read the risk notice below
+> before continuing.
 
 > [!WARNING]
 > **WorkBuddy 上游正在收紧对非官方客户端的识别与拦截。**
@@ -37,12 +43,12 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/chinayury/WorkBuddy2API-Bridge/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-2496ED?style=flat-square" alt="Version 0.1.0"></a>
+  <a href="https://github.com/chinayury/WorkBuddy2API-Bridge/releases"><img src="https://img.shields.io/badge/Release-v0.2.0-2496ED?style=flat-square" alt="Version 0.2.0"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
   <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/Maintenance-Low--frequency-c96f3d?style=flat-square" alt="Low-frequency maintenance">
+  <img src="https://img.shields.io/badge/Maintenance-Active-c96f3d?style=flat-square" alt="Active upstream maintenance">
 </p>
 
 把腾讯 **[www.workbuddy.ai](https://www.workbuddy.ai)**（国际版）与 **[codebuddy.cn](https://www.codebuddy.cn)**（国内版）的原生服务封装成标准 OpenAI 兼容接口（Chat Completions / Responses），并提供默认关闭的实验性 Anthropic Messages 适配；同时补齐多账号调度与运维能力：
@@ -191,10 +197,11 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 241 个套件：182 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 249 个套件：190 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 - 架构说明见 **[docs/ARCHITECTURE-v0.1.0.md](docs/ARCHITECTURE-v0.1.0.md)** —— 请求生命周期、协议适配、流式管线、账号池、调度器、控制面与发布工程的事实性说明（每条结论对应真实文件与行号）。
+- v0.2.0（上游 v1.9.2 同步）的文档：**[变更日志](docs/CHANGELOG-v0.2.0.md)** · **[上游同步记录](docs/UPSTREAM-TRACKING-v1.9.2.md)**
 - v0.1.0 正式版的其余文档：**[项目介绍](docs/README-v0.1.0-formal.md)** · **[变更日志](docs/CHANGELOG-v0.1.0-formal.md)** · **[BUG 修复清单](docs/BUGFIXES-v0.1.0-formal.md)** · **[安全审查报告](docs/SECURITY-v0.1.0-formal.md)** · **[部署与升级](docs/DEPLOY-v0.1.0-formal.md)** · **[使用说明](docs/USAGE-v0.1.0-formal.md)**
 
 ---
@@ -500,14 +507,81 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
-- **仓库改名为 `WorkBuddy2API-Bridge`**：GitHub 仓库从 `chinayury/workbuddy2api-hub` 改名为 [`chinayury/WorkBuddy2API-Bridge`](https://github.com/chinayury/WorkBuddy2API-Bridge)，与项目名一致；旧地址永久跳转到新地址，既有 clone 不受影响。README 顶部版本徽章此前指向上游的 releases 页并显示上游版本号，现改为指向本仓库的 releases 与自己的 `0.1.x` 版本线；两份 v0.1.0 交付文档里的 `git clone` 与 `cd` 目录名同步更新。**未变**：镜像名 `workbuddy2api-hub`、compose 服务名 `wb-proxy`、HTTP `Server` 头 `wb-proxy/<版本>`、服务器部署路径 `/opt/workbuddy2api-hub/`，以及发布产物名 `workbuddy2api-hub-v*.zip` —— 这些是既有部署与升级链路依赖的标识符。 / **Repository renamed to `WorkBuddy2API-Bridge`**: the GitHub repository moved from `chinayury/workbuddy2api-hub` to [`chinayury/WorkBuddy2API-Bridge`](https://github.com/chinayury/WorkBuddy2API-Bridge), matching the project name; the old address redirects permanently, so existing clones keep working. The release badge in the README header pointed at the upstream releases page and showed the upstream version; it now points at this repository's releases and at this fork's own `0.1.x` line, and the `git clone` / `cd` lines in the two v0.1.0 delivery documents were updated to match. **Unchanged**: the image name `workbuddy2api-hub`, the compose service name `wb-proxy`, the HTTP `Server` header `wb-proxy/<version>`, the server deploy path `/opt/workbuddy2api-hub/`, and the release asset names `workbuddy2api-hub-v*.zip` — those are the identifiers existing deployments and the upgrade path depend on.
+- **同步上游 workbuddy2api-hub v1.9.2**（本版核心，2026-10-31）：上游自本项目基线 `d1a8913` 之后共 20 个提交，
+  扣掉 3 个纯发版提交与 2 个本项目早已并入的修复（#644 stderr 日志通道、#647 国际版活跃降级），
+  **真正并入的是 14 个功能/测试提交**，覆盖 31 个文件（+2746 −154）。逐项裁决见
+  **[docs/UPSTREAM-TRACKING-v1.9.2.md](docs/UPSTREAM-TRACKING-v1.9.2.md)**。落地的新能力：
+
+  - **`/health` 按区域与模型报可用数**（#667）：新增 `accounts_ready_by_realm`、`models_ready`、
+    `accounts_ready_current_realm` 等字段，「还剩几个号能服务」不再只有一个总数；
+  - **池空失败的出口统一**（#665 / #666）：状态码只有一个决定点，**用量行与客户端看到的码一致**
+    （原先账本记 502、客户端拿 503，同一事件两处口径相反），池空报错还会说清「在等谁、等多久」；
+  - **401 真失效不再被当成代理页**：认网关下发的 `WWW-Authenticate`，凭据真失效时按失效处理，
+    而不是把网关的登录页当成上游正文；
+  - **收费模型撞 6004 也保住「配额用尽」这个事实**（#668）：不再一律降级成「未知错误」；
+  - **目录里免费的模型不占积分保底额度**（#e38fcb2）：免费模型不会被「积分保底」挡掉；
+  - **每日活跃持久化 11140 限制并停止重试**：被风控的账号当天不再反复重试；
+  - **面板密码加密异常明确报错**（#658）：解释器缺 `hashlib.pbkdf2_hmac` 时不再把异常吞成
+    「密码错误」返回 401，而是明确返回 500 与排查指引，启动自检与 `/health`、`/panel/status`
+    暴露 `crypto_ok`；
+  - **DSH 文件引用段的 11-128 渠道指纹中和**（#835da5a）：上游仍会 400 / 11-128 的那条指纹一并处理；
+  - **看板窄屏修复**：活动记录说明/昵称列分档截断、活动表短标签列不再逐字折行、
+    下拉不再误判全宽竖排；
+  - **两个可选开关（默认关，升级后行为不变）**：`WB_STOP_AT_SSE_DONE=1` 在收到上游 SSE `[DONE]`
+    后立即停止读取；`WB_CACHE_HTTP_ERROR_BODY=1` 缓存首次读取的上游错误正文供后续读取。
+
+  **冲突处理**：本项目与上游**没有共同祖先**（v0.1.0 基线从已验证发布包还原，提交历史重新起过），
+  因此按「上游基线提交为 base」做三方合并，**15 处冲突逐处人工裁决，没有一处自动取一侧**：
+  上游的异步日志队列 + 本项目的凭据打码同时保留；上游统一的失败出口改用本项目的三协议判据；
+  上游的 `/health` 新字段与本项目的可用性字段同时保留；版本号一律留在本项目 `0.x` 版本线。
+
+  / **Synced upstream workbuddy2api-hub v1.9.2** (the core of this release): 14 of the 20
+  upstream commits after this fork's baseline were ported — per-realm/per-model readiness in
+  `/health`, one decision point for pool-empty status codes (the usage ledger and the client now
+  agree), `WWW-Authenticate` handling so a genuinely dead credential is no longer mistaken for a
+  proxy login page, the 6004 "quota exhausted" fact being preserved, catalogue-free models exempt
+  from the credit reserve, persisted 11140 restrictions, an explicit panel-password crypto error,
+  the DSH 11-128 fingerprint, three narrow-screen dashboard fixes, and two optional switches
+  (`WB_STOP_AT_SSE_DONE`, `WB_CACHE_HTTP_ERROR_BODY`, both off by default). The two trees share no
+  common ancestor, so the merge was a three-way merge against the upstream baseline and all 15
+  conflicts were resolved by hand, keeping both intents rather than picking a side.
+
+- **修正 `ready(refresh=False)` 的语义：临期账号仍算「可用」**：只读口径下「令牌快到期」原先直接判不可用，
+  等于把刷新这条路整个堵死 —— 池里所有账号都临期时网关会报「无可用账号」(503)，而这些号其实每个都能
+  刷新后正常服务。本项目选号路径本来就只读（不产生网络请求），真正要用某个账号的那一步
+  （`open_upstream`）会用 `token_needs_refresh()` 给**被选中的那一个**账号刷一次、失败就换号，
+  所以正确口径是「只读时算可用、刷新按需」。改动后刷新仍是「只刷一个」，不会退化成刷新风暴，
+  `/health` 的按模型可用数也不再少算临期账号。 / **Fixed the read-only availability rule**: a
+  near-expiry token is still servable when the check is read-only; the refresh stays on-demand and
+  only touches the account actually being used.
+
+- **修复 `count_ready()` 收了 `refresh` 参数却不用**：该参数形同虚设，调用方传什么都不影响行为。
+  现在真正尊重它：探针类调用可以显式要求只读。 / **Fixed `count_ready()` ignoring its own
+  `refresh` argument**.
+
+- **修复基线里遗留的 10 处中文注释乱码**：`wb_accounts.py` / `wb_proxy.py` / `wb_alerts.py` /
+  `wb_update_external.py` 的注释里有 U+FFFD 替换字符（v0.1.0 基线从发布包还原时经过一次 GBK 往返）。
+  上游同版本为 0 处，说明是本项目自带的。已按上下文逐处补回正确汉字，仓库现已 0 处乱码。 /
+  **Repaired 10 mojibake characters** left by the v0.1.0 baseline restore.
+
+- **回归套件 241 → 249**（并入上游 8 个新套件：面板密码加密、HTTP 可用性、空池状态码、
+  健康检查就绪度、错误正文缓存、SSE 终止、积分保底豁免、无可用账号范围）：**249 个套件全绿**
+  （190 个 Python + 59 个 JS）。 / **Regression suite 241 → 249, all green.**
+
+- **仓库改名为 `WorkBuddy2API-Bridge`**：GitHub 仓库从 `chinayury/workbuddy2api-hub` 改名为 [`chinayury/WorkBuddy2API-Bridge`](https://github.com/chinayury/WorkBuddy2API-Bridge)，与项目名一致；旧地址永久跳转到新地址，既有 clone 不受影响。README 顶部版本徽章此前指向上游的 releases 页并显示上游版本号，现改为指向本仓库的 releases 与自己的 `0.x` 版本线；两份 v0.1.0 交付文档里的 `git clone` 与 `cd` 目录名同步更新。**未变**：镜像名 `workbuddy2api-hub`、compose 服务名 `wb-proxy`、HTTP `Server` 头 `wb-proxy/<版本>`、服务器部署路径 `/opt/workbuddy2api-hub/`，以及发布产物名 `workbuddy2api-hub-v*.zip` —— 这些是既有部署与升级链路依赖的标识符。 / **Repository renamed to `WorkBuddy2API-Bridge`**: the GitHub repository moved from `chinayury/workbuddy2api-hub` to [`chinayury/WorkBuddy2API-Bridge`](https://github.com/chinayury/WorkBuddy2API-Bridge), matching the project name; the old address redirects permanently, so existing clones keep working. The release badge in the README header pointed at the upstream releases page and showed the upstream version; it now points at this repository's releases and at this fork's own `0.x` line, and the `git clone` / `cd` lines in the two v0.1.0 delivery documents were updated to match. **Unchanged**: the image name `workbuddy2api-hub`, the compose service name `wb-proxy`, the HTTP `Server` header `wb-proxy/<version>`, the server deploy path `/opt/workbuddy2api-hub/`, and the release asset names `workbuddy2api-hub-v*.zip` — those are the identifiers existing deployments and the upgrade path depend on.
 
 - **实验性桌面 chat 请求头一致性（默认关闭）**：设置进程环境 `WB_DESKTOP_CHAT_COMPAT=1` 后重启，仅桌面产品的 chat 去除浏览器请求头、补齐 SDK runtime 头及 B3 parent span。参考 [workbuddy2api-panel 的桌面报文对照](https://github.com/misakano7545/workbuddy2api-panel/blob/e7d1e70bb0234552eba31706672ad0a601877b5f/internal/upstream/headers.go)，未独立复核其原始抓包。沿用现有版本/OS/架构覆盖项，不硬编码 Windows，不伪造设备 token；CLI、VSCode、计费 REST、请求体和风控退避不变。不是 TLS 指纹模拟或免封保证。 / **Experimental desktop chat header consistency (off by default)**: set the process environment `WB_DESKTOP_CHAT_COMPAT=1` and restart to remove browser headers and add SDK runtime headers and a B3 parent span for desktop chat only. The linked panel project reports this desktop profile; its raw captures have not been independently verified here. Existing version/OS/architecture overrides are respected, with no hard-coded Windows or invented device tokens. CLI, VSCode, billing REST, request bodies and abuse backoff are unchanged. This is not TLS impersonation or a ban-avoidance guarantee.
 
-- **v1.7.33 已于 2026-10-23 发布**：本版集成 #630、#632、#635、#638，并自本版起进入低频维护。完整变更与验证记录见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v173)**；下一版的改动继续写在本段。
+- **上游 v1.7.33 于 2026-10-23 发布**（本项目 fork 的起点）：本版集成 #630、#632、#635、#638，并自本版起进入低频维护。上游此后已发布 v1.8.0 / v1.9.0 / v1.9.1 / v1.9.2，其中 **v1.9.2 已于本版并入**（见上方第一条）。完整变更与验证记录见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**；下一版的改动继续写在本段。
+- **面板密码加密异常明确报错**（#658）：解释器缺少 `hashlib.pbkdf2_hmac` 支持时（如 Windows SAC 拦截便携运行时 DLL），不再将计算异常吞成「密码错误」返回 401，而是明确返回 500 与环境排查指引；启动自检与 `/health`、`/panel/status` 暴露 `crypto_ok` 状态并在面板提示。新增 `tests/_test_panel_crypto_unavailable.py`。
+- **v1.9.1 发布**：集成 #692 与 #693，详见 [更新记录](docs/CHANGELOG.md#v191)。
+- **流式终止**：设置 `WB_STOP_AT_SSE_DONE=1` 后，收到上游 SSE `[DONE]` 立即结束读取；默认关闭，保持原有行为。 / **Stream termination**: set `WB_STOP_AT_SSE_DONE=1` to stop reading at the upstream SSE `[DONE]` marker; disabled by default to retain existing behavior.
+- **HTTP 错误正文**：设置 `WB_CACHE_HTTP_ERROR_BODY=1` 后缓存首次读取的错误正文，供后续读取使用；默认关闭。 / **HTTP error body**: set `WB_CACHE_HTTP_ERROR_BODY=1` to retain the first error-body read for later readers; disabled by default.
 
 - **stderr 日志通道改为入队 + 单写线程，日志再也不能拖死请求**（#642）：`log()` 原先在请求线程里直接 `sys.stderr.write()` + `flush()`。#489 的 `try/except` 接得住「写抛异常」，接不住「写阻塞」——stderr 是一条读端还在、却没人消费的管道时（后台任务、服务管理器、`| tee` 的消费端已退出、智能体 runner 拉了 `stderr=PIPE` 却不读），缓冲写满后 `write()` 永久不返回且不抛异常。而 `send_response()` 会先调 `log_request()`，于是每个请求都停**在响应头发出之前**；`/health`、`/realm`、`/panel/status` 在静默白名单里照常 200，从外面看就是「服务健在、只有面板坏了」。现在请求线程只对有界队列（2000 行）做 `put_nowait()`，真正的写由一个守护线程独占：它阻塞也只阻塞它自己，队列满则丢行并计数（首次与每 1000 行把「正在丢日志」以 WARN 记进看板日志，不再往堵住的通道上写）；退出路径（`/shutdown` 与控制台关闭处理）用 0.5s 超时把已入队的行刷完，卡住的通道拖不住退出；`sys.stderr is None`（pythonw）提前跳过，不再每行抛一次。日志内容、脱敏口径与看板 buffer 顺序都不变。验证：v1.7.33 上 `repro_pipe_block.py` 第 54 个请求卡死（同时 `/health` 仍 200、关掉读端立刻恢复），本修复后同样的 4000 个请求 0 失败；`tests/_test_dead_stderr_keeps_serving.py` 补「没人读的管道」与「stderr 的写不在调用 log() 的线程上」两组断言（v1.7.33 上 4 项红，修后 17 项全绿）。 / Make the stderr log channel non-blocking (#642): `log()` used to `sys.stderr.write()` + `flush()` right on the request thread. The `try/except` from #489 covers the case where the write **raises**, not where it **blocks**: when stderr is a pipe whose read end is alive but never drained (background task, service manager, a `| tee` consumer that exited, an agent runner that spawns with `stderr=PIPE` and stops reading), `write()` never returns once the buffer fills, and no exception is raised. `send_response()` calls `log_request()` *before* the headers go out, so every request parks before it answers anything, while `/health`, `/realm` and `/panel/status` stay on the quiet whitelist and keep answering 200 — from outside it looks like "the service is fine, only the panel is broken". Request threads now only `put_nowait()` onto a bounded queue (2000 lines); a single daemon thread owns stderr, so a blocking write parks that thread alone, and a full queue drops the line and counts it (the first drop and every 1000th are reported as a WARN in the panel log rather than written into the blocked channel). The exit paths (`/shutdown`, the console close handler) flush queued lines with a 0.5s timeout, so even a wedged channel cannot hold the process. `sys.stderr is None` under pythonw is skipped up front instead of raising per line. Log content, masking and the panel buffer order are unchanged. Verified: on v1.7.33 `repro_pipe_block.py` hangs at request #54 (with `/health` still 200, and recovery the moment the read end closes); with this change the same 4000 requests all answer. `tests/_test_dead_stderr_keeps_serving.py` gains "an undrained pipe" and "the stderr write is not on the calling thread" cases (4 red on v1.7.33, 17 green after).
 - **国际版每日活跃：沙箱证书校验失败时改走活跃上报**（#645）：上游给网页通道分配的 ACP 沙箱域名 `*.workbuddy.cloudagent-app.net` 解析到腾讯云 EdgeOne，边缘节点下发的是 `*.cdn.myqcloud.com` 通配证书，Python 的 ssl 必然报 `Hostname mismatch`；这一轮重试永远不会成功，旧实现却把它当成「这一轮没跑完」按预算重试到底，最后整轮判 `ok: false`，面板上一片「集体封号」的错觉（实际积分照发，丢的只是连登）。现在国际版也能上报活跃：`report_activity()` 不再只限国内版，国际版按自己的 base（`www.workbuddy.ai`）打 `POST /v2/report`，`fetch_streak_days()` 同样按账号出口选 base，所以连登天数能正确回显。网页腿失败且错误串命中证书校验标记时，若设置页新开关「证书失败改走活跃上报」打开（**默认关**，与其它行为变更一致），改走一次活跃上报并把当天算完成（结果里带 `web_fallback` 明细）；开关关着时行为与升级前完全一致——仍如实报失败、仍不写 `lastDailyChat`，好让下一轮巡检重试。非证书类失败（沙箱没就绪、轮次超时、业务拒绝）一律不降级，避免把「真的没跑完」记成完成。新增 `tests/_test_daily_chat_activity_fallback.py`（12 项：证书文本判定、开关默认关与往返、国际版 base 选择、降级成功 / 上报被拒 / 非证书失败不降级 / 国内版不受影响），并把 `tests/_test_streak_report.py` 里两条「国际版永不参与活跃上报」的断言按新语义改写。 / Global daily activity: fall back to the activity report when the sandbox certificate fails (#645): the ACP sandbox host the upstream hands out for the web channel resolves to Tencent EdgeOne, whose edge nodes serve a wildcard certificate for another domain, so Python ssl always raises a hostname mismatch. That round can never succeed, yet the old code treated it as a slow round, retried until the budget ran out and finally marked the whole run as failed, which reads as a mass ban - while the credits were actually granted and only the streak was lost. Global accounts can now report activity too: report_activity() is no longer China-only, it posts to /v2/report on the account own base (www.workbuddy.ai), and fetch_streak_days() picks the base from the account realm so the streak is reported correctly. When the web leg fails with a certificate marker and the new panel switch (off by default, like every other behaviour change) is on, one activity report is made and the day counts as done (the result carries a web_fallback detail); with the switch off the behaviour is unchanged - the run still reports failure and still leaves lastDailyChat unwritten so the next sweep retries. Non-certificate failures (sandbox not ready, turn timeout, business rejection) never fall back, so a genuine unfinished run is never recorded as done. Adds tests/_test_daily_chat_activity_fallback.py (12 checks) and rewrites the two Global-never-reports-activity assertions in tests/_test_streak_report.py.
+- **v1.9.0 发布**：汇总 v1.8.0 之后的 10 个社区 PR（#649、#650、#652、#653、#669、#670、#671、#672、#684、#686）。完整变更、验证范围与已知限制见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v190)**；下一版的改动继续写在本段。
+- **v1.8.0 发布**：汇总 v1.7.33 之后的 #640、#642、#643、#645/#647，并补齐 #578、#618、#625 的发布记录。完整变更、验证范围与已知限制见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v180)**；下一版的改动继续写在本段。
 - **修正 CN 专属模型判定，并给 OpenCode 写入真实上下文上限**（#618 / #625）：`minimax-` 曾被当成整个模型家族的 CN 专属前缀，于是国际版也提供的 `minimax-m3.1-flash` 被本地 400 拦下。现在只保留确定的 CN 独占项（`deepseek-v4-pro*` 与显式 `minimax-m3`），同族其他模型按出口实际目录判断。OpenCode 一键配置此前只写空的模型条目，客户端只能回落到自己的 200k 默认值；现在把网关目录中的 `context_window` / `max_output` 写进 `limit.context` / `limit.output`，没有规格的条目仍保持空对象。新增回归覆盖。 / Narrow the China-only model gate and give OpenCode the real context limit (#618 / #625): `minimax-` used to mark the whole family as CN-exclusive, so the globally served `minimax-m3.1-flash` was refused locally with a 400. Only the confirmed China-only entries remain (`deepseek-v4-pro*` and the explicit `minimax-m3`); other members of the family follow the actual catalogue of the selected exit. OpenCode's one-click config used to write empty model entries, so it fell back to its own 200k default; the gateway's catalogue `context_window` / `max_output` now go into `limit.context` / `limit.output`, while entries without specs stay empty objects. Regression coverage added.
 - **流式回复在真实静默期发送 SSE 心跳**（#578）：上游思考期间可能长时间一个字节都不发，而客户端会把静默误判为断流；只在每次阻塞读之前检查心跳，恰好无法覆盖它。Chat、Responses 与 Anthropic Messages 三条流式路径现在共用后台 `SSEHeartbeat`：每 15 秒无写入就发送合法的 `: keepalive` 注释帧，与业务帧共用锁，保证不会截断 JSON；响应正常时不会多插帧，流结束后线程立即停止。新增 `tests/_test_stream_keepalive.py`（9 项，含读线程阻塞期间仍收到心跳与并发写入完整性），并复跑流式 id、usage 帧、断流错误帧与重试套件。 / Keep SSE streams alive through real upstream silence (#578): while the model is thinking the upstream may send nothing for longer than the client's idle window, and checking a heartbeat only before the next blocking read cannot cover that gap. Chat, Responses and Anthropic Messages now share a background `SSEHeartbeat`: after 15 idle seconds it writes a valid `: keepalive` comment frame under the same lock as application writes, so JSON frames cannot be split; responsive streams gain no extra frames and the thread stops as soon as the stream ends. Added `tests/_test_stream_keepalive.py` (9 checks, including heartbeat delivery while the reader is blocked and write integrity under contention), and re-ran the stream id, usage-frame, abort-frame and retry suites.
 
@@ -599,13 +673,13 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 - **DSH 一键配置放宽限流重试，修掉「对话到一半链接中断」**：WorkBuddy 的 429 冷却通常约一分钟，而 DSH 的默认 `retryPolicy` 是 `normal` / 最多 5 次 / 退避 500ms 起翻倍、封顶 10s——加起来不到 16 秒就放弃，冷却还没结束回合就以 `RATE_LIMIT` 失败。一键配置现在给 `wb-proxy` 单独写 `retryPolicy: {mode: normal, maxRetries: 8, backoff: {initialDelayMs: 2000, maxDelayMs: 30000, jitterRatio: 0.1}}`（合计约 2 分半），只影响 `wb-proxy`，其它 provider 仍用默认策略；字段与取值按 `@deepseek-ai/dsh-llm` 的 `RetryPolicySchema`。已经接入过的机器重新点一次「一键配置」即可补上这段（幂等），重启 DSH 生效。
   DSH's default per-provider retry policy (normal, at most 5 retries, 500ms→10s backoff, under 16 seconds in total) gives up before WorkBuddy's ~60s rate-limit cooldown ends, so the turn dies with `RATE_LIMIT` — which the user sees as the conversation breaking mid-flight. The one-click config now writes a wider `retryPolicy` for `wb-proxy` only (8 retries, 2s initial delay, 30s cap, ~2.5 minutes in total); other providers keep the default policy. Field names and bounds follow `@deepseek-ai/dsh-llm`'s `RetryPolicySchema`. Re-running the one-click config on an already-integrated machine adds it idempotently, and a DSH restart applies it.
 
-已发布版本的完整记录（v1.4.5 ~ v1.7.33，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+已发布版本的完整记录（v1.4.5 ~ v1.9.2，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
 ## 七、致谢与引用声明 (Credits & References)
 
 协议兼容、风控规避与任务链路设计过程中，参考并吸纳了以下开源项目的经验与逆向成果：
 
-- **上游项目（本仓库的 fork 来源）**：**[ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)** —— 本仓库整体派生自该仓库（MIT），基线为上游 v1.8.0；除下述各项目的借鉴外，基线代码本身亦来自上游；
+- **上游项目（本仓库的 fork 来源）**：**[ardeyouxipianyi/workbuddy2api-hub](https://github.com/ardeyouxipianyi/workbuddy2api-hub)** —— 本仓库整体派生自该仓库（MIT），**当前已同步到上游 v1.9.2**（基线为上游 `d1a8913`，同步过程与冲突裁决见 [docs/UPSTREAM-TRACKING-v1.9.2.md](docs/UPSTREAM-TRACKING-v1.9.2.md)）；除下述各项目的借鉴外，基线代码本身亦来自上游；
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)**：成长任务全链路逆向、设备指纹稳定派生（`derive_id`）、整点排程调度（`Scheduler`）、指纹脱敏与 `reasoning_content` 回填；
 - **[CangShui/workbuddy-cliproxy-fix](https://github.com/CangShui/workbuddy-cliproxy-fix)**：早期客户端代理修复与接口差异参考；
 - **[lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy)** 与 **[mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins)**：网关通信与多插件管理原型参考；
